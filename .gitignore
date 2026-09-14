@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+attendance.db
+dataset/*
+!.gitkeep
+.streamlit/

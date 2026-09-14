@@ -1,0 +1,12 @@
+{
+    "db_type": "sqlserver",
+    "sqlite_path": "attendance.db",
+    "sqlserver": {
+        "server": "DESKTOP-FLMIP09",
+        "database": "FaceAttendanceDB",
+        "driver": "ODBC Driver 17 for SQL Server",
+        "trusted_connection": true,
+        "username": "",
+        "password": ""
+    }
+}
