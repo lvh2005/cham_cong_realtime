@@ -1,0 +1,226 @@
+{% extends "base.html" %}
+
+{% block title %}{{ employee.full_name }} ({{ employee.employee_code }}) - Chi tiết nhân viên{% endblock %}
+{% block page_title %}Chi Tiết Hồ Sơ Nhân Viên{% endblock %}
+
+{% block content %}
+<div class="row g-4">
+  <!-- Left Column: Employee Profile Card -->
+  <div class="col-12 col-lg-4">
+    <div class="card border-0 shadow-sm text-center p-4 mb-4" style="border-radius: 12px;">
+      <!-- Avatar -->
+      <div class="d-flex justify-content-center mb-3">
+        {% if employee.image_url %}
+          <img src="{{ employee.image_url }}" alt="{{ employee.full_name }}" class="avatar-img avatar-lg shadow-sm" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+          <div class="avatar-placeholder avatar-lg shadow-sm" style="display: none;">{{ employee.full_name[:2].upper() }}</div>
+        {% else %}
+          <div class="avatar-placeholder avatar-lg shadow-sm">{{ employee.full_name[:2].upper() }}</div>
+        {% endif %}
+      </div>
+
+      <h5 class="fw-bold mb-1">{{ employee.full_name }}</h5>
+      <div class="mb-3">
+        <span class="badge bg-light text-dark border font-monospace fs-6">{{ employee.employee_code }}</span>
+      </div>
+
+      <div class="d-flex justify-content-center gap-2 mb-3">
+        {% if employee.status == 'ACTIVE' %}
+          <span class="badge badge-active px-3 py-2">ACTIVE</span>
+        {% else %}
+          <span class="badge badge-inactive px-3 py-2">INACTIVE</span>
+        {% endif %}
+
+        {% if embedding_count > 0 %}
+          <span class="badge badge-registered px-3 py-2">
+            <i class="bi bi-check-circle-fill me-1"></i>REGISTERED ({{ embedding_count }})
+          </span>
+        {% else %}
+          <span class="badge badge-not-registered px-3 py-2">
+            <i class="bi bi-exclamation-triangle-fill me-1"></i>NOT REGISTERED
+          </span>
+        {% endif %}
+      </div>
+
+      <hr class="my-3">
+
+      <!-- Details List -->
+      <div class="text-start small">
+        <div class="d-flex justify-content-between py-1 border-bottom">
+          <span class="text-muted">Phòng ban:</span>
+          <span class="fw-semibold">{{ employee.department or 'Chưa phân bổ' }}</span>
+        </div>
+        <div class="d-flex justify-content-between py-1 border-bottom">
+          <span class="text-muted">Chức vụ:</span>
+          <span class="fw-semibold">{{ employee.position or '-' }}</span>
+        </div>
+        <div class="d-flex justify-content-between py-1 border-bottom">
+          <span class="text-muted">Ngày tạo:</span>
+          <span class="fw-semibold">{{ employee.created_at or '-' }}</span>
+        </div>
+        <div class="d-flex justify-content-between py-1 border-bottom">
+          <span class="text-muted">Cập nhật:</span>
+          <span class="fw-semibold">{{ employee.updated_at or '-' }}</span>
+        </div>
+        <div class="d-flex justify-content-between py-1">
+          <span class="text-muted">Cloudinary ID:</span>
+          <span class="font-monospace text-truncate" style="max-width: 150px;">{{ employee.cloudinary_public_id or '(Chưa có)' }}</span>
+        </div>
+      </div>
+
+      <hr class="my-3">
+
+      <!-- Action Buttons -->
+      <div class="d-grid gap-2">
+        <a href="{{ url_for('employees.edit', employee_id=employee.id) }}" class="btn btn-outline-primary">
+          <i class="bi bi-pencil-square me-1"></i> Sửa thông tin
+        </a>
+
+        {% if employee.status == 'ACTIVE' %}
+          <form method="POST" action="{{ url_for('employees.deactivate', employee_id=employee.id) }}" onsubmit="return confirm('Bạn có chắc chắn muốn vô hiệu hóa nhân viên này? Vector khuôn mặt sẽ tạm ngưng nhận diện.');">
+            <button type="submit" class="btn btn-outline-warning w-100">
+              <i class="bi bi-pause-circle me-1"></i> Vô hiệu hóa (INACTIVE)
+            </button>
+          </form>
+        {% else %}
+          <form method="POST" action="{{ url_for('employees.activate', employee_id=employee.id) }}" onsubmit="return confirm('Kích hoạt lại nhân viên này và nạp lại vector vào FAISS?');">
+            <button type="submit" class="btn btn-outline-success w-100">
+              <i class="bi bi-play-circle me-1"></i> Kích hoạt lại (ACTIVE)
+            </button>
+          </form>
+        {% endif %}
+
+        <button type="button" class="btn btn-outline-danger" data-bs-toggle="modal" data-bs-target="#deleteModal">
+          <i class="bi bi-trash3 me-1"></i> Xóa vĩnh viễn (Hard Delete)
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Right Column: Face Vectors & Attendance History -->
+  <div class="col-12 col-lg-8">
+    <!-- 1. Face Vectors in DB -->
+    <div class="card border-0 shadow-sm mb-4" style="border-radius: 12px;">
+      <div class="card-header bg-white py-3 border-0 d-flex justify-content-between align-items-center">
+        <h6 class="mb-0 fw-bold"><i class="bi bi-cpu text-primary me-2"></i>Dữ liệu Face Embeddings (128-D)</h6>
+        <span class="badge bg-light text-dark border">{{ embedding_count }} Vectors Active</span>
+      </div>
+      <div class="card-body p-3">
+        {% if embeddings %}
+          <div class="table-responsive">
+            <table class="table table-sm table-bordered align-middle mb-0" style="font-size: 0.85rem;">
+              <thead class="table-light">
+                <tr>
+                  <th>FaceID (FAISS ID)</th>
+                  <th>Trạng Thái</th>
+                  <th>Kích thước</th>
+                  <th>Thời Gian Nạp</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for emb in embeddings %}
+                  <tr>
+                    <td><span class="font-monospace fw-bold text-primary">#{{ emb.face_id }}</span></td>
+                    <td>
+                      {% if emb.is_active %}
+                        <span class="badge bg-success">Active</span>
+                      {% else %}
+                        <span class="badge bg-secondary">Disabled</span>
+                      {% endif %}
+                    </td>
+                    <td><code>128 floats (512 bytes)</code></td>
+                    <td>{{ emb.created_at[:19] if emb.created_at else '-' }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <div class="text-center py-3 text-muted">
+            <i class="bi bi-camera-video-off fs-3 d-block mb-1"></i>
+            Chưa có vector khuôn mặt nào được đăng ký. Vui lòng sử dụng ứng dụng Tkinter để chụp và lưu khuôn mặt AI.
+          </div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- 2. Recent Attendance History -->
+    <div class="card border-0 shadow-sm" style="border-radius: 12px;">
+      <div class="card-header bg-white py-3 border-0 d-flex justify-content-between align-items-center">
+        <h6 class="mb-0 fw-bold"><i class="bi bi-clock-history text-success me-2"></i>Lịch sử chấm công gần nhất (15 lượt)</h6>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-custom table-hover align-middle mb-0" style="font-size: 0.85rem;">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Check-in</th>
+              <th>Check-out</th>
+              <th>Trạng Thái</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% if recent_attendance %}
+              {% for att in recent_attendance %}
+                <tr>
+                  <td><span class="text-muted font-monospace">#{{ att.id }}</span></td>
+                  <td><span class="text-success fw-medium">{{ att.check_in }}</span></td>
+                  <td>
+                    {% if att.check_out %}
+                      <span class="text-secondary fw-medium">{{ att.check_out }}</span>
+                    {% else %}
+                      <span class="text-muted fst-italic">--:--:--</span>
+                    {% endif %}
+                  </td>
+                  <td>
+                    {% if att.check_out %}
+                      <span class="badge badge-checkout">Đã check-out</span>
+                    {% else %}
+                      <span class="badge badge-checkin">Đang làm việc</span>
+                    {% endif %}
+                  </td>
+                </tr>
+              {% endfor %}
+            {% else %}
+              <tr>
+                <td colspan="4" class="text-center py-4 text-muted">
+                  Chưa có lịch sử chấm công nào cho nhân viên này.
+                </td>
+              </tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Modal Hard Delete Confirmation -->
+<div class="modal fade" id="deleteModal" tabindex="-1" aria-labelledby="deleteModalLabel" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header bg-danger text-white">
+        <h5 class="modal-title" id="deleteModalLabel"><i class="bi bi-exclamation-triangle-fill me-2"></i>Xác nhận Xóa Vĩnh Viễn</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <p>Bạn đang thực hiện xóa vĩnh viễn nhân viên <strong>{{ employee.full_name }} ({{ employee.employee_code }})</strong>.</p>
+        <div class="alert alert-warning mb-0 small">
+          <strong>Cảnh báo:</strong> Thao tác này sẽ xóa hoàn toàn:
+          <ul class="mb-0 ps-3 mt-1">
+            <li>Hồ sơ nhân viên trong bảng <code>employees</code></li>
+            <li>Toàn bộ vector khuôn mặt trong <code>face_embeddings</code> & FAISS</li>
+            <li>Lịch sử chấm công trong <code>attendance</code></li>
+            <li>Ảnh đại diện trên <strong>Cloudinary</strong></li>
+          </ul>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Hủy bỏ</button>
+        <form method="POST" action="{{ url_for('employees.delete', employee_id=employee.id) }}">
+          <button type="submit" class="btn btn-danger">Xác nhận XÓA VĨNH VIỄN</button>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

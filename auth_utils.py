@@ -3,7 +3,9 @@ import json
 import os
 from typing import Any, Dict, Tuple
 
-AUTH_CONFIG_FILE = "admin_config.json"
+import config
+
+AUTH_CONFIG_FILE = os.path.join(config.BASE_DIR, "admin_config.json")
 
 DEFAULT_ADMIN = {
     "username": "admin",

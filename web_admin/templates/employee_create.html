@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+
+{% block title %}Thêm Nhân viên Mới - Face Attendance Admin{% endblock %}
+{% block page_title %}Tạo Mới Hồ Sơ Nhân Viên{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+  <div class="col-12 col-lg-8">
+    <div class="card border-0 shadow-sm" style="border-radius: 12px;">
+      <div class="card-header bg-white py-3 border-0">
+        <h6 class="mb-0 fw-bold"><i class="bi bi-person-plus-fill text-success me-2"></i>Nhập thông tin nhân viên</h6>
+      </div>
+
+      <div class="card-body p-4">
+        <!-- AI Registration Notice -->
+        <div class="alert alert-info d-flex align-items-start gap-3 mb-4" role="alert">
+          <i class="bi bi-info-circle-fill fs-4 flex-shrink-0"></i>
+          <div>
+            <h6 class="alert-heading fw-bold mb-1">Quy trình Đăng ký Khuôn mặt AI</h6>
+            <p class="mb-0 small">
+              Khi tạo hồ sơ tại đây, nhân viên sẽ có trạng thái <strong>NOT REGISTERED</strong> (Chưa có khuôn mặt). 
+              Sau khi lưu thông tin, nhân viên vui lòng đến <strong>Máy chấm công Tkinter</strong> để chụp 3-5 góc mặt và tự động nạp vector vào hệ thống nhận diện AI & FAISS.
+            </p>
+          </div>
+        </div>
+
+        <form method="POST" action="{{ url_for('employees.create') }}">
+          <div class="row g-3">
+            <!-- Employee Code -->
+            <div class="col-12 col-md-6">
+              <label for="employee_code" class="form-label fw-semibold">Mã Nhân Viên <span class="text-danger">*</span></label>
+              <input type="text" class="form-control text-uppercase font-monospace" id="employee_code" name="employee_code" 
+                     value="{{ employee_code or '' }}" placeholder="Ví dụ: NV001, EMP102..." required autofocus>
+              <div class="form-text">Mã định danh duy nhất (Unique) trong toàn hệ thống.</div>
+            </div>
+
+            <!-- Full Name -->
+            <div class="col-12 col-md-6">
+              <label for="full_name" class="form-label fw-semibold">Họ và Tên <span class="text-danger">*</span></label>
+              <input type="text" class="form-control" id="full_name" name="full_name" 
+                     value="{{ full_name or '' }}" placeholder="Ví dụ: Nguyễn Văn A..." required>
+            </div>
+
+            <!-- Department -->
+            <div class="col-12 col-md-6">
+              <label for="department" class="form-label fw-semibold">Phòng Ban</label>
+              <input type="text" class="form-control" id="department" name="department" list="deptOptions" 
+                     value="{{ department or '' }}" placeholder="Chọn hoặc nhập phòng ban...">
+              <datalist id="deptOptions">
+                {% for d in departments %}
+                  <option value="{{ d }}">
+                {% endfor %}
+              </datalist>
+            </div>
+
+            <!-- Position -->
+            <div class="col-12 col-md-6">
+              <label for="position" class="form-label fw-semibold">Chức Vụ</label>
+              <input type="text" class="form-control" id="position" name="position" 
+                     value="{{ position or '' }}" placeholder="Ví dụ: Nhân viên, Trưởng phòng...">
+            </div>
+          </div>
+
+          <hr class="my-4">
+
+          <div class="d-flex justify-content-end gap-2">
+            <a href="{{ url_for('employees.index') }}" class="btn btn-outline-secondary">
+              <i class="bi bi-arrow-left me-1"></i> Hủy & Quay lại
+            </a>
+            <button type="submit" class="btn btn-success px-4">
+              <i class="bi bi-check-circle-fill me-1"></i> Lưu hồ sơ nhân viên
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,167 @@
+{% extends "base.html" %}
+
+{% block title %}Hệ thống & FAISS - Face Attendance Admin{% endblock %}
+{% block page_title %}Trạng Thái Hệ Thống & Quản Lý FAISS{% endblock %}
+
+{% block content %}
+<div class="row g-4">
+  <!-- 1. SQL Server Status -->
+  <div class="col-12 col-md-6 col-xl-4">
+    <div class="card border-0 shadow-sm h-100" style="border-radius: 12px;">
+      <div class="card-header bg-white py-3 border-0 d-flex justify-content-between align-items-center">
+        <h6 class="mb-0 fw-bold"><i class="bi bi-database-fill text-primary me-2"></i>Microsoft SQL Server</h6>
+        {% if db_info.status == 'CONNECTED' %}
+          <span class="badge bg-success"><i class="bi bi-check-circle-fill me-1"></i>CONNECTED</span>
+        {% else %}
+          <span class="badge bg-danger"><i class="bi bi-x-circle-fill me-1"></i>ERROR</span>
+        {% endif %}
+      </div>
+      <div class="card-body">
+        <ul class="list-unstyled mb-0 small">
+          <li class="d-flex justify-content-between py-1 border-bottom">
+            <span class="text-muted">Server:</span>
+            <span class="font-monospace fw-semibold">{{ db_info.server }}</span>
+          </li>
+          <li class="d-flex justify-content-between py-1 border-bottom">
+            <span class="text-muted">Database:</span>
+            <span class="font-monospace fw-semibold">{{ db_info.database }}</span>
+          </li>
+          <li class="d-flex justify-content-between py-1 border-bottom">
+            <span class="text-muted">Driver:</span>
+            <span class="font-monospace text-truncate" style="max-width: 180px;">{{ db_info.driver }}</span>
+          </li>
+          <li class="d-flex justify-content-between py-1">
+            <span class="text-muted">Trusted Connection:</span>
+            <span class="fw-semibold">{{ 'Yes (Windows Auth)' if db_info.trusted else 'No (SQL Auth)' }}</span>
+          </li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- 2. Cloudinary Status -->
+  <div class="col-12 col-md-6 col-xl-4">
+    <div class="card border-0 shadow-sm h-100" style="border-radius: 12px;">
+      <div class="card-header bg-white py-3 border-0 d-flex justify-content-between align-items-center">
+        <h6 class="mb-0 fw-bold"><i class="bi bi-cloud-check-fill text-info me-2"></i>Cloudinary Storage</h6>
+        {% if cloud_info.status == 'CONFIGURED' %}
+          <span class="badge bg-success"><i class="bi bi-check-circle-fill me-1"></i>CONFIGURED</span>
+        {% else %}
+          <span class="badge bg-warning text-dark"><i class="bi bi-exclamation-triangle-fill me-1"></i>NOT CONFIGURED</span>
+        {% endif %}
+      </div>
+      <div class="card-body">
+        <ul class="list-unstyled mb-0 small">
+          <li class="d-flex justify-content-between py-1 border-bottom">
+            <span class="text-muted">Cloud Name:</span>
+            <span class="font-monospace fw-semibold">{{ cloud_info.cloud_name }}</span>
+          </li>
+          <li class="d-flex justify-content-between py-1 border-bottom">
+            <span class="text-muted">Folder Lưu Trữ:</span>
+            <span class="font-monospace fw-semibold">{{ cloud_info.folder }}</span>
+          </li>
+          <li class="d-flex justify-content-between py-1">
+            <span class="text-muted">Mục đích:</span>
+            <span class="fw-semibold">Lưu ảnh đại diện nhân viên online</span>
+          </li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- 3. FAISS Engine Overview -->
+  <div class="col-12 col-md-6 col-xl-4">
+    <div class="card border-0 shadow-sm h-100" style="border-radius: 12px;">
+      <div class="card-header bg-white py-3 border-0 d-flex justify-content-between align-items-center">
+        <h6 class="mb-0 fw-bold"><i class="bi bi-cpu-fill text-success me-2"></i>FAISS Vector Engine</h6>
+        {% if faiss_info.status == 'READY' %}
+          <span class="badge bg-success"><i class="bi bi-check-circle-fill me-1"></i>READY</span>
+        {% else %}
+          <span class="badge bg-danger"><i class="bi bi-x-circle-fill me-1"></i>ERROR</span>
+        {% endif %}
+      </div>
+      <div class="card-body">
+        <ul class="list-unstyled mb-0 small">
+          <li class="d-flex justify-content-between py-1 border-bottom">
+            <span class="text-muted">Vectors trong FAISS:</span>
+            <span class="badge bg-primary fs-6">{{ faiss_info.vectors_count }}</span>
+          </li>
+          <li class="d-flex justify-content-between py-1 border-bottom">
+            <span class="text-muted">Active Vectors trong DB:</span>
+            <span class="badge bg-secondary fs-6">{{ faiss_info.db_active_embeddings }}</span>
+          </li>
+          <li class="d-flex justify-content-between py-1">
+            <span class="text-muted">Nhân viên Active:</span>
+            <span class="fw-semibold">{{ faiss_info.active_employees }} người</span>
+          </li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- 4. FAISS Details & Rebuild Tool -->
+  <div class="col-12">
+    <div class="card border-0 shadow-sm" style="border-radius: 12px;">
+      <div class="card-header bg-white py-3 border-0">
+        <h6 class="mb-0 fw-bold"><i class="bi bi-sliders text-secondary me-2"></i>Chi tiết Kỹ thuật & Công cụ Rebuild FAISS</h6>
+      </div>
+
+      <div class="card-body p-4">
+        <div class="row g-4 align-items-center">
+          <div class="col-12 col-lg-7">
+            <h6 class="fw-bold mb-2">Thông số Kỹ thuật FAISS Index:</h6>
+            <div class="table-responsive">
+              <table class="table table-sm table-bordered mb-0 small">
+                <tbody>
+                  <tr>
+                    <td class="bg-light fw-semibold" style="width: 200px;">Cấu trúc Index</td>
+                    <td><code>{{ faiss_info.index_type }}</code></td>
+                  </tr>
+                  <tr>
+                    <td class="bg-light fw-semibold">Số chiều vector (Dimension)</td>
+                    <td><code>{{ faiss_info.dimension }} chiều (Float32)</code></td>
+                  </tr>
+                  <tr>
+                    <td class="bg-light fw-semibold">File lưu trữ Index</td>
+                    <td><code>{{ faiss_info.file_path }}</code></td>
+                  </tr>
+                  <tr>
+                    <td class="bg-light fw-semibold">Dung lượng file index</td>
+                    <td><code>{{ faiss_info.file_size_kb }} KB</code></td>
+                  </tr>
+                  <tr>
+                    <td class="bg-light fw-semibold">Match Threshold (L2)</td>
+                    <td><code>{{ faiss_info.match_threshold }}</code></td>
+                  </tr>
+                  <tr>
+                    <td class="bg-light fw-semibold">Duplicate Check Threshold</td>
+                    <td><code>{{ faiss_info.duplicate_threshold }}</code></td>
+                  </tr>
+                  <tr>
+                    <td class="bg-light fw-semibold">Ambiguous Margin</td>
+                    <td><code>{{ faiss_info.ambiguous_margin }}</code></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="col-12 col-lg-5">
+            <div class="card bg-light border p-3" style="border-radius: 10px;">
+              <h6 class="fw-bold text-dark mb-2"><i class="bi bi-arrow-repeat me-1 text-primary"></i>Đồng bộ & Tái tạo FAISS Index</h6>
+              <p class="small text-muted mb-3">
+                Khi thực hiện thay đổi nhân viên, kích hoạt hoặc vô hiệu hóa hồ sơ, bạn có thể bấm nút dưới đây để nạp lại toàn bộ vector khuôn mặt active từ SQL Server và ghi đè file <code>face.index</code> mới nhất.
+              </p>
+              <form method="POST" action="{{ url_for('system.rebuild_faiss') }}">
+                <button type="submit" class="btn btn-primary w-100 py-2 fw-semibold" onclick="return confirm('Tiến hành Rebuild FAISS Index từ CSDL SQL Server?');">
+                  <i class="bi bi-arrow-clockwise me-1"></i> Rebuild FAISS Index Ngay
+                </button>
+              </form>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

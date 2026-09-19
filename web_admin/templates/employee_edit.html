@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+
+{% block title %}Sửa Nhân viên - {{ employee.full_name }}{% endblock %}
+{% block page_title %}Chỉnh Sửa Hồ Sơ Nhân Viên{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+  <div class="col-12 col-lg-8">
+    <div class="card border-0 shadow-sm" style="border-radius: 12px;">
+      <div class="card-header bg-white py-3 border-0">
+        <h6 class="mb-0 fw-bold"><i class="bi bi-pencil-square text-primary me-2"></i>Cập nhật thông tin nhân viên #{{ employee.id }}</h6>
+      </div>
+
+      <div class="card-body p-4">
+        <form method="POST" action="{{ url_for('employees.edit', employee_id=employee.id) }}">
+          <div class="row g-3">
+            <!-- Employee Code -->
+            <div class="col-12 col-md-6">
+              <label for="employee_code" class="form-label fw-semibold">Mã Nhân Viên <span class="text-danger">*</span></label>
+              <input type="text" class="form-control text-uppercase font-monospace" id="employee_code" name="employee_code" 
+                     value="{{ employee.employee_code }}" required>
+              <div class="form-text">Lưu ý: Thay đổi mã nhân viên sẽ cập nhật toàn bộ dữ liệu liên quan.</div>
+            </div>
+
+            <!-- Full Name -->
+            <div class="col-12 col-md-6">
+              <label for="full_name" class="form-label fw-semibold">Họ và Tên <span class="text-danger">*</span></label>
+              <input type="text" class="form-control" id="full_name" name="full_name" 
+                     value="{{ employee.full_name }}" required>
+            </div>
+
+            <!-- Department -->
+            <div class="col-12 col-md-6">
+              <label for="department" class="form-label fw-semibold">Phòng Ban</label>
+              <input type="text" class="form-control" id="department" name="department" list="deptOptions" 
+                     value="{{ employee.department }}" placeholder="Nhập phòng ban...">
+              <datalist id="deptOptions">
+                {% for d in departments %}
+                  <option value="{{ d }}">
+                {% endfor %}
+              </datalist>
+            </div>
+
+            <!-- Position -->
+            <div class="col-12 col-md-6">
+              <label for="position" class="form-label fw-semibold">Chức Vụ</label>
+              <input type="text" class="form-control" id="position" name="position" 
+                     value="{{ employee.position }}" placeholder="Nhập chức vụ...">
+            </div>
+
+            <!-- Status -->
+            <div class="col-12 col-md-6">
+              <label for="status" class="form-label fw-semibold">Trạng Thái Hoạt Động</label>
+              <select class="form-select" id="status" name="status">
+                <option value="ACTIVE" {% if employee.status == 'ACTIVE' %}selected{% endif %}>ACTIVE (Hoạt động bình thường)</option>
+                <option value="INACTIVE" {% if employee.status == 'INACTIVE' %}selected{% endif %}>INACTIVE (Tạm ngưng / Nghỉ việc)</option>
+              </select>
+            </div>
+          </div>
+
+          <hr class="my-4">
+
+          <div class="d-flex justify-content-end gap-2">
+            <a href="{{ url_for('employees.detail', employee_id=employee.id) }}" class="btn btn-outline-secondary">
+              <i class="bi bi-arrow-left me-1"></i> Hủy bỏ
+            </a>
+            <button type="submit" class="btn btn-primary px-4">
+              <i class="bi bi-save me-1"></i> Lưu thay đổi
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

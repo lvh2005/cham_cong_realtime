@@ -32,35 +32,44 @@ def _speak_pyttsx3_fallback(text: str):
         print(f"Lỗi pyttsx3 fallback: {e}")
 
 
+_VOICE_LOCK = threading.Lock()
+
+
 def speak_async(text: str = "Xin cảm ơn!", employee_name: Optional[str] = None):
     """
     Phát giọng nói tiếng Việt 'Xin cảm ơn...' bất đồng bộ không chặn UI.
     Tự động cache file âm thanh để các lần sau phát tức thì 0ms.
     """
     def worker():
-        full_text = text
-        if employee_name and employee_name.strip():
-            full_text = f"Xin cảm ơn {employee_name.strip()}!"
-
-        # Đặt tên file cache an toàn
-        safe_name = "".join(c for c in full_text if c.isalnum() or c in (" ", "_", "-")).strip().replace(" ", "_")
-        cache_file = os.path.join(SOUNDS_DIR, f"{safe_name}.mp3")
-
-        # 1. Nếu đã có file âm thanh trong cache -> phát ngay
-        if os.path.exists(cache_file) and os.path.getsize(cache_file) > 1000:
-            _play_mp3_windows(cache_file)
-            return
-
-        # 2. Tạo file âm thanh bằng gTTS tiếng Việt chuẩn
         try:
-            from gtts import gTTS
-            tts = gTTS(text=full_text, lang="vi", slow=False)
-            tts.save(cache_file)
+            full_text = text
+            if employee_name and employee_name.strip():
+                full_text = f"Xin cảm ơn {employee_name.strip()}!"
+
+            # Đặt tên file cache an toàn
+            safe_name = "".join(c for c in full_text if c.isalnum() or c in (" ", "_", "-")).strip().replace(" ", "_")
+            cache_file = os.path.join(SOUNDS_DIR, f"{safe_name}.mp3")
+
+            # 1. Nếu đã có file âm thanh trong cache -> phát ngay
+            if os.path.exists(cache_file) and os.path.getsize(cache_file) > 1000:
+                _play_mp3_windows(cache_file)
+                return
+
+            # 2. Tạo file âm thanh bằng gTTS tiếng Việt chuẩn
+            with _VOICE_LOCK:
+                if not os.path.exists(cache_file) or os.path.getsize(cache_file) <= 1000:
+                    try:
+                        from gtts import gTTS
+                        tts = gTTS(text=full_text, lang="vi", slow=False)
+                        tts.save(cache_file)
+                    except Exception as ex:
+                        print(f"Không thể tải gTTS, chuyển sang engine offline: {ex}")
+                        _speak_pyttsx3_fallback(full_text)
+                        return
+
             _play_mp3_windows(cache_file)
-        except Exception as ex:
-            print(f"Không thể tải gTTS, chuyển sang engine offline: {ex}")
-            # 3. Fallback pyttsx3
-            _speak_pyttsx3_fallback(full_text)
+        except Exception as e:
+            print(f"Lỗi worker giọng nói: {e}")
 
     threading.Thread(target=worker, daemon=True).start()
 

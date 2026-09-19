@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% set login_page = True %}
+
+{% block title %}Đăng nhập - Face Attendance Admin{% endblock %}
+
+{% block login_content %}
+<div class="card border-0 shadow-lg" style="width: 100%; max-width: 420px; border-radius: 16px;">
+  <div class="card-body p-4 p-sm-5">
+    <div class="text-center mb-4">
+      <div class="d-inline-flex align-items-center justify-content-center bg-primary bg-opacity-10 text-primary rounded-circle mb-3" style="width: 64px; height: 64px;">
+        <i class="bi bi-shield-lock-fill fs-2"></i>
+      </div>
+      <h4 class="fw-bold mb-1">ĐĂNG NHẬP</h4>
+      <p class="text-muted small">Hệ thống Quản trị Chấm công Khuôn mặt</p>
+    </div>
+
+    <form method="POST" action="{{ url_for('auth.login', next=request.args.get('next')) }}">
+      <div class="mb-3">
+        <label for="username" class="form-label fw-semibold" style="font-size: 0.9rem;">Tên đăng nhập</label>
+        <div class="input-group">
+          <span class="input-group-text bg-light"><i class="bi bi-person"></i></span>
+          <input type="text" class="form-control" id="username" name="username" placeholder="Nhập admin..." required autofocus>
+        </div>
+      </div>
+
+      <div class="mb-4">
+        <label for="password" class="form-label fw-semibold" style="font-size: 0.9rem;">Mật khẩu</label>
+        <div class="input-group">
+          <span class="input-group-text bg-light"><i class="bi bi-key"></i></span>
+          <input type="password" class="form-control" id="password" name="password" placeholder="Nhập mật khẩu..." required>
+        </div>
+      </div>
+
+      <button type="submit" class="btn btn-primary w-100 py-2 fw-semibold shadow-sm" style="border-radius: 8px;">
+        <i class="bi bi-box-arrow-in-right me-1"></i> Đăng nhập hệ thống
+      </button>
+    </form>
+
+    <div class="mt-4 pt-3 border-top text-center text-muted" style="font-size: 0.8rem;">
+      Tài khoản mặc định: <code>admin</code> &bull; Mật khẩu: <code>admin123</code>
+    </div>
+  </div>
+</div>
+{% endblock %}

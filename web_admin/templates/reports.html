@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+
+{% block title %}Báo cáo & Xuất Excel - Face Attendance Admin{% endblock %}
+{% block page_title %}Báo Cáo & Xuất Dữ Liệu Excel{% endblock %}
+
+{% block content %}
+<!-- Filter & Export Card -->
+<div class="card border-0 shadow-sm mb-4" style="border-radius: 12px;">
+  <div class="card-header bg-white py-3 border-0">
+    <h6 class="mb-0 fw-bold"><i class="bi bi-file-earmark-excel-fill text-success me-2"></i>Bộ lọc trích xuất báo cáo</h6>
+  </div>
+
+  <div class="card-body p-4">
+    <form method="GET" action="{{ url_for('reports.index') }}" class="row g-3">
+      <!-- Start Date -->
+      <div class="col-12 col-md-3">
+        <label class="form-label fw-semibold small">Từ ngày</label>
+        <input type="date" class="form-control" name="start_date" value="{{ start_date }}">
+      </div>
+
+      <!-- End Date -->
+      <div class="col-12 col-md-3">
+        <label class="form-label fw-semibold small">Đến ngày</label>
+        <input type="date" class="form-control" name="end_date" value="{{ end_date }}">
+      </div>
+
+      <!-- Employee -->
+      <div class="col-12 col-md-4">
+        <label class="form-label fw-semibold small">Nhân viên</label>
+        <select class="form-select" name="employee_code">
+          <option value="">-- Tất cả nhân viên --</option>
+          {% for emp in employees %}
+            <option value="{{ emp.employee_code }}" {% if employee_code == emp.employee_code %}selected{% endif %}>
+              {{ emp.employee_code }} - {{ emp.full_name }} ({{ emp.department or 'Chưa phân bổ' }})
+            </option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <!-- Action Buttons -->
+      <div class="col-12 col-md-2 d-flex align-items-end gap-2">
+        <button type="submit" class="btn btn-primary w-100">
+          <i class="bi bi-eye-fill me-1"></i> Xem trước
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Preview & Download Section -->
+<div class="card border-0 shadow-sm" style="border-radius: 12px;">
+  <div class="card-header bg-white py-3 border-0 d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <div>
+      <h6 class="mb-0 fw-bold"><i class="bi bi-table text-primary me-2"></i>Xem trước dữ liệu xuất Excel</h6>
+      <small class="text-muted">Tổng số dòng trích xuất: <strong>{{ total_records }}</strong> bản ghi</small>
+    </div>
+    <div>
+      <a href="{{ url_for('reports.export_excel', start_date=start_date, end_date=end_date, employee_code=employee_code) }}" 
+         class="btn btn-success shadow-sm">
+        <i class="bi bi-file-earmark-arrow-down-fill me-1"></i> Tải File Excel (.xlsx)
+      </a>
+    </div>
+  </div>
+
+  <div class="table-responsive">
+    <table class="table table-custom table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th>Mã NV</th>
+          <th>Họ và Tên</th>
+          <th>Ngày Chấm Công</th>
+          <th>Giờ Vào</th>
+          <th>Giờ Ra</th>
+          <th>Tổng Giờ Làm (h)</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% if records %}
+          {% for r in records %}
+            <tr>
+              <td><span class="badge bg-light text-dark border font-monospace fw-bold">{{ r['Mã NV'] }}</span></td>
+              <td class="fw-semibold">{{ r['Họ tên'] }}</td>
+              <td>{{ r['Ngày'] }}</td>
+              <td><span class="text-success fw-medium">{{ r['Giờ vào'] }}</span></td>
+              <td>
+                {% if r['Giờ ra'] %}
+                  <span class="text-secondary fw-medium">{{ r['Giờ ra'] }}</span>
+                {% else %}
+                  <span class="text-muted fst-italic">--:--:--</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if r['Tổng giờ làm'] %}
+                  <span class="badge bg-light text-dark border font-monospace">{{ r['Tổng giờ làm'] }}h</span>
+                {% else %}
+                  <span class="text-muted">-</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        {% else %}
+          <tr>
+            <td colspan="6" class="text-center py-5 text-muted">
+              <i class="bi bi-folder-x fs-1 d-block mb-2"></i>
+              Không có dữ liệu chấm công nào trong khoảng thời gian đã chọn.
+            </td>
+          </tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

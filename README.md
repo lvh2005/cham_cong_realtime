@@ -1,135 +1,172 @@
-# Face Attendance - Hệ thống Chấm Công Nhận Diện Khuôn Mặt (Tkinter + SQL Server)
-
-Hệ thống chấm công bằng nhận diện khuôn mặt Realtime viết thuần bằng Python **Tkinter Desktop GUI**, xử lý luồng Camera trực tiếp bằng **OpenCV** + **face_recognition** và kết nối cơ sở dữ liệu **Microsoft SQL Server** (hỗ trợ cả SQLite dự phòng).
-
----
-
-## 🌟 Tính Năng Chính
-
-- **Nhận diện khuôn mặt chuẩn xác**: Sử dụng `face_recognition` (dlib HOG model) tạo vector đặc trưng 128 chiều chuẩn hóa L2 norm.
-- **Giao diện Desktop Tkinter (`main.py` / `app_tkinter.py`)**:
-  - 📊 **Tổng quan (Dashboard)**: Thống kê tổng nhân viên, số lượt check-in hôm nay, số ca đã hoàn thành và bảng điểm danh thời gian thực.
-  - 👤 **Đăng ký nhân viên**: Luồng webcam trực tiếp, chụp 8–10 ảnh với góc mặt/biểu cảm đa dạng, hỗ trợ tải ảnh từ máy, gallery thumbnail và thanh tiến trình encode.
-  - 📷 **Chấm công Realtime**: Camera trực tiếp qua OpenCV không trễ mạng, vẽ khung bounding box, tên, độ khớp sai số (distance), tự động chuyển trạng thái Check-in / Check-out với Cooldown (75s) chống chấm công lặp.
-  - 📋 **Lịch sử chấm công**: Lọc theo khoảng ngày (Từ ngày -> Đến ngày), lọc theo nhân viên, xem tổng giờ làm việc.
-  - 📈 **Xuất báo cáo Excel**: Xuất file `.xlsx` chuyên nghiệp với độ rộng cột tự động và bộ lọc.
-  - ⚙️ **Quản lý nhân viên**: Danh sách nhân viên, xem số lượng ảnh dataset và xóa nhân viên kèm dữ liệu liên quan.
-  - 🗄️ **Cấu hình Database**: Kết nối Microsoft SQL Server qua `pyodbc`, kiểm tra kết nối trực tiếp trên giao diện.
-- **Hỗ trợ Microsoft SQL Server**: Cung cấp sẵn file script `setup_sqlserver.sql` để chạy trên SQL Server Management Studio (SSMS).
+# Face Attendance - Hệ Thống Chấm Công Nhận Diện Khuôn Mặt Tốc Độ Cao
+## Kiến trúc: Tkinter App (Máy Chấm Công) + Flask Web Admin (Quản Trị Local/LAN) + FAISS + SQL Server + Cloudinary
+### Khả năng đáp ứng: 10.000+ nhân viên • 30.000 - 50.000 Face Vectors
 
 ---
 
-## 📁 Cấu Trúc Dự Án
+## 🌟 1. Giới Thiệu & Kiến Trúc Hệ Thống
+
+Hệ thống kết hợp mô hình 2 tiến trình độc lập hoạt động song song trên máy tính cục bộ (Local/LAN), dùng chung CSDL Microsoft SQL Server, Cloudinary và thuật toán FAISS:
+
+1. **Tkinter Kiosk App (`python main.py`)**: Đóng vai trò làm máy chấm công camera tại cửa ra vào (nhận diện Realtime, chụp ảnh đăng ký khuôn mặt AI 3-5 góc độ, cảnh báo âm thanh tiếng Việt).
+2. **Flask Web Admin Portal (`python web_admin/app.py`)**: Đóng vai trò trang web quản trị Dashboard, quản lý hồ sơ nhân viên, xem lịch sử chấm công, vẽ biểu đồ Chart.js, xuất báo cáo Excel và Rebuild FAISS Index. Có thể truy cập qua trình duyệt máy tính hoặc điện thoại cùng mạng Wi-Fi.
+
+```text
+┌────────────────────────────────────────────────────────┐
+│                   MÁY TÍNH CỤC BỘ                      │
+│                                                        │
+│   [Tiến trình 1]                    [Tiến trình 2]     │
+│   Tkinter App (GUI)                 Flask Web Admin    │
+│   (Camera + Chấm công)              (Port 5000 / LAN)  │
+│         │                                  │           │
+│         │         ┌────────────────────────┤           │
+│         ▼         ▼                        ▼           │
+│    Microsoft SQL Server               Cloudinary       │
+│    (FaceAttendanceDB)            (Lưu ảnh đại diện)    │
+│         ▲                                              │
+│         │                                              │
+│    FAISS Engine                                        │
+│    (IndexIDMap2 - 128D)                                │
+└────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 💻 2. Yêu Cầu Hệ Thống & Cài Đặt
+
+- **Hệ điều hành**: Windows 10 / Windows 11 (64-bit)
+- **Python**: Python 3.10 hoặc 3.11
+- **Cơ sở dữ liệu**: Microsoft SQL Server 2016+ (hoặc SQL Express / Developer)
+- **ODBC Driver**: `ODBC Driver 17 for SQL Server`
+- **Dependencies**: `pip install -r requirements.txt`
+
+---
+
+## ⚙️ 3. Cấu Hình Biến Môi Trường (.env)
+
+File `.env` tại thư mục gốc `face_attendance/`:
+
+```env
+# 1. KẾT NỐI MICROSOFT SQL SERVER
+DB_SERVER=localhost
+DB_DATABASE=FaceAttendanceDB
+DB_DRIVER=ODBC Driver 17 for SQL Server
+DB_TRUSTED_CONNECTION=true
+DB_USER=sa
+DB_PASSWORD=
+
+# 2. CẤU HÌNH CLOUDINARY (LƯU ẢNH NHÂN VIÊN)
+CLOUDINARY_CLOUD_NAME=your_cloud_name
+CLOUDINARY_API_KEY=your_api_key
+CLOUDINARY_API_SECRET=your_api_secret
+CLOUDINARY_FOLDER=face_attendance/employees
+
+# 3. THAM SỐ NHẬN DIỆN & FAISS
+FACE_MATCH_THRESHOLD=0.48
+FACE_DUPLICATE_THRESHOLD=0.40
+FACE_AMBIGUOUS_MARGIN=0.06
+ATTENDANCE_COOLDOWN_SECONDS=60
+RECOGNITION_FRAME_SKIP=3
+
+# 4. CẤU HÌNH FLASK WEB ADMIN
+FLASK_HOST=0.0.0.0
+FLASK_PORT=5000
+FLASK_SECRET_KEY=face_attendance_flask_secret_2026_key
+```
+
+---
+
+## 🚀 4. Hướng Dẫn Khởi Chạy Hệ Thống
+
+### 🔹 Cách 1: Chạy Máy Chấm Công (Tkinter)
+Mở Terminal 1:
+```powershell
+python main.py
+```
+*(Dùng để điểm danh nhận diện khuôn mặt realtime và chụp ảnh đăng ký nhân viên mới).*
+
+### 🔹 Cách 2: Chạy Web Admin Quản Trị (Flask)
+Mở Terminal 2:
+```powershell
+python web_admin/app.py
+```
+
+- **Truy cập trên máy tính:** [http://localhost:5000](http://localhost:5000) hoặc [http://127.0.0.1:5000](http://127.0.0.1:5000)
+- **Truy cập từ điện thoại / Laptop cùng Wi-Fi:** `http://<IP_MAY_TINH>:5000` (Ví dụ: `http://192.168.1.15:5000`)
+- **Tài khoản đăng nhập mặc định:**
+  - Tên đăng nhập: `admin`
+  - Mật khẩu: `admin123`
+
+---
+
+## 🌐 5. Các Chức Năng Chính Trên Web Admin
+
+| Route | Chức Năng & Đặc Điểm |
+| :--- | :--- |
+| `/login`, `/logout` | Đăng nhập/Đăng xuất Admin bảo vệ session, tái sử dụng `auth_utils.py` & `admin_config.json`. |
+| `/` hoặc `/dashboard` | Dashboard tổng quan: 8 metric cards, biểu đồ Chart.js (lưu lượng chấm công theo giờ, nhân viên theo phòng ban), bảng 10 lượt chấm công gần nhất kèm avatar Cloudinary. |
+| `/employees` | Quản lý danh sách nhân viên: Tìm kiếm, lọc phòng ban, lọc ACTIVE/INACTIVE, hiển thị badge `REGISTERED` / `NOT REGISTERED`, phân trang (Pagination). |
+| `/employees/create` | Tạo mới hồ sơ nhân viên trực tiếp từ Web (trạng thái `NOT REGISTERED`), sau đó nhân viên đến máy Tkinter để chụp mặt AI. |
+| `/employees/<id>` | Xem chi tiết nhân viên, thông tin vector khuôn mặt trong SQL Server, 15 lượt chấm công gần nhất, nút Sửa, Vô hiệu hóa, Kích hoạt lại và Xóa vĩnh viễn. |
+| `/employees/<id>/edit` | Chỉnh sửa Họ tên, Phòng ban, Chức vụ, Trạng thái (tự động kiểm tra Unique Mã NV). |
+| `/attendance` | Xem và lọc nhật ký chấm công toàn diện: Lọc theo khoảng ngày, phòng ban, tìm kiếm mã/tên, phân trang. |
+| `/reports`, `/reports/export` | Báo cáo chấm công tổng hợp và nút xuất file Excel `.xlsx` tải trực tiếp về máy. |
+| `/system` | Giám sát trạng thái SQL Server, Cloudinary, thông số FAISS Vector Engine và nút **Rebuild FAISS Index** từ database. |
+
+---
+
+## 📁 6. Cấu Trúc Dự Án
 
 ```text
 face_attendance/
-├── main.py              # File khởi chạy chính của ứng dụng
-├── app_tkinter.py       # Giao diện Desktop thuần Tkinter
-├── setup_sqlserver.sql  # Script tạo Database & Bảng trên MS SQL Server
-├── database.py          # Module kết nối MS SQL Server & SQLite
-├── face_utils.py        # Tiền xử lý ảnh an toàn và thuật toán nhận diện
-├── attendance.py        # Logic chấm công, cooldown & báo cáo
-├── db_config.json       # File cấu hình kết nối CSDL (mặc định SQL Server)
-├── requirements.txt     # Danh sách thư viện cần thiết
-├── README.md            # Hướng dẫn sử dụng
-└── dataset/             # Thư mục lưu ảnh gốc đăng ký của nhân viên
-    └── NV001/
-        ├── 01.jpg
-        ├── 02.jpg
-        └── ...
+│
+├── assets/                    # Âm thanh thông báo
+│   └── sounds/
+│
+├── data/                      # Lưu trữ FAISS Index
+│   └── faiss/
+│       └── face.index
+│
+├── temp/                      # Thư mục tạm
+├── dataset/                   # Dataset
+│
+├── .env                       # Cấu hình biến môi trường
+├── .env.example               # Mẫu biến môi trường
+├── requirements.txt           # Thư viện phụ thuộc
+├── main.py                    # Entry point khởi chạy Tkinter Kiosk
+├── app_tkinter.py             # Giao diện Desktop Tkinter
+├── config.py                  # Module cấu hình tập trung
+├── database.py                # SQL Server queries & Web Admin helpers
+├── face_utils.py              # Xử lý nhận diện khuôn mặt
+├── faiss_utils.py             # Bộ máy tìm kiếm vector FAISS
+├── cloudinary_utils.py        # Upload & quản lý avatar Cloudinary
+├── attendance.py              # Xử lý chấm công & xuất báo cáo
+├── auth_utils.py              # Xác thực Admin
+├── voice_utils.py             # Giọng nói thông báo tiếng Việt
+├── setup_sqlserver.sql        # Script tạo CSDL SQL Server
+│
+└── web_admin/                 # 🚀 MODULE FLASK WEB ADMIN MỚI
+    ├── app.py                 # Entry point khởi chạy Web Admin
+    ├── routes/
+    │   ├── auth.py            # Route Login & Logout
+    │   ├── dashboard.py       # Route Dashboard & Chart.js data
+    │   ├── employees.py       # Route CRUD nhân viên & phân trang
+    │   ├── attendance.py      # Route lịch sử chấm công
+    │   ├── reports.py         # Route báo cáo & xuất Excel
+    │   └── system.py          # Route trạng thái hệ thống & Rebuild FAISS
+    ├── templates/
+    │   ├── base.html          # Layout chuẩn Bootstrap 5 & Sidebar
+    │   ├── login.html         # Giao diện đăng nhập
+    │   ├── dashboard.html     # Dashboard thống kê & biểu đồ
+    │   ├── employees.html     # Danh sách nhân viên phân trang
+    │   ├── employee_create.html # Form thêm nhân viên
+    │   ├── employee_detail.html # Chi tiết nhân viên & face vectors
+    │   ├── employee_edit.html # Form sửa nhân viên
+    │   ├── attendance.html    # Lịch sử chấm công & bộ lọc
+    │   ├── reports.html       # Báo cáo & nút xuất Excel
+    │   └── system.html        # Trạng thái hệ thống & Rebuild FAISS
+    └── static/
+        ├── css/style.css      # Custom styling & status badges
+        └── js/main.js         # Mobile drawer & live clock
 ```
-
-
----
-
-## ⚙️ Cài Đặt Môi Trường
-
-Khuyến nghị:
-- **Hệ điều hành**: Windows 10 / Windows 11
-- **Python**: Python 3.10 hoặc 3.11
-
-Mở PowerShell hoặc CMD tại thư mục `face_attendance`:
-
-```powershell
-# 1. Kích hoạt môi trường ảo (nếu có)
-.\venv\Scripts\activate
-
-# 2. Cài đặt các thư viện cần thiết
-pip install -r requirements.txt
-```
-
-> [!NOTE]
-> **Khắc phục lỗi `Unsupported image type, must be 8bit gray or RGB image.`:**
-> Lỗi này xảy ra khi dùng NumPy 2.x với dlib cũ hoặc khi truyền ảnh có kênh Alpha (RGBA 4 kênh). Trong dự án này, lỗi đã được khắc phục triệt để bằng cách:
-> 1. Khóa phiên bản `numpy>=1.24.0,<2.0.0` (cụ thể `numpy==1.26.4`).
-> 2. Hàm `ensure_rgb_uint8()` trong `face_utils.py` tự động chuẩn hóa mọi ảnh về mảng RGB 3 kênh liên tục kiểu `uint8`.
-
----
-
-## 🚀 Hướng Dẫn Chạy Ứng Dụng
-
-### Chạy Giao Diện Desktop Tkinter (Chính):
-```powershell
-py app_tkinter.py
-# hoặc
-python app_tkinter.py
-```
-
-### Chạy Giao Diện Web Streamlit (Tùy chọn):
-```powershell
-streamlit run app.py
-```
-
----
-
-## 🗄️ Hướng Dẫn Cấu Hình Microsoft SQL Server
-
-Hệ thống hỗ trợ 100% Microsoft SQL Server thông qua `pyodbc`. Bạn có thể cấu hình bằng 2 cách:
-
-### Cách 1: Cấu hình trực tiếp trên giao diện Tkinter
-1. Mở ứng dụng, vào tab **🗄️ Cấu hình Database**.
-2. Chọn **Microsoft SQL Server**.
-3. Điền thông tin:
-   - **Server**: Tên máy chủ (VD: `localhost`, `127.0.0.1`, `DESKTOP-ABC\SQLEXPRESS`).
-   - **Database Name**: Tên database (VD: `FaceAttendanceDB`).
-   - **ODBC Driver**: Chọn `ODBC Driver 17 for SQL Server` hoặc `SQL Server`.
-   - **Authentication**: Tích chọn *Windows Authentication* (mặc định) hoặc bỏ chọn để nhập Username `sa` và Password.
-4. Bấm nút **🔍 Kiểm tra kết nối**.
-5. Bấm nút **💾 Lưu cấu hình & Khởi tạo CSDL** để tự động tạo các bảng `employees`, `attendance`.
-
-### Cách 2: Sửa file `db_config.json`
-Tạo hoặc chỉnh sửa file `db_config.json` trong thư mục gốc:
-```json
-{
-    "db_type": "sqlserver",
-    "sqlite_path": "attendance.db",
-    "sqlserver": {
-        "server": "localhost",
-        "database": "FaceAttendanceDB",
-        "driver": "ODBC Driver 17 for SQL Server",
-        "trusted_connection": true,
-        "username": "sa",
-        "password": ""
-    }
-}
-```
-
----
-
-## 📖 Quy Trình Sử Dụng Điểm Danh
-
-1. **Đăng ký nhân viên**:
-   - Vào tab **👤 Đăng ký nhân viên**.
-   - Nhập Mã NV (VD: `NV001`) và Họ tên (VD: `Nguyễn Văn A`).
-   - Bấm **Bật Camera** rồi bấm **📸 Chụp ảnh** (8–10 ảnh ở các góc mặt, ánh sáng và biểu cảm khác nhau).
-   - Bấm **💾 Encode & Lưu Nhân Viên**.
-2. **Chấm công Realtime**:
-   - Vào tab **📷 Chấm công Realtime**.
-   - Bấm **▶ Bắt đầu điểm danh**.
-   - Khi đứng trước camera, hệ thống sẽ tự động nhận diện và ghi nhận:
-     - Lần 1: **Check-in**
-     - Lần 2: **Check-out** (sau khi hết thời gian Cooldown 75 giây).
-3. **Xem & Xuất báo cáo**:
-   - Vào tab **📋 Lịch sử chấm công** để tra cứu dữ liệu.
-   - Vào tab **📈 Xuất báo cáo Excel** để tải file `.xlsx`.
 

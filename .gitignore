@@ -1,7 +1,32 @@
-.venv/
+# Python & Bytecode
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.whl
+
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# Environment Variables & Secrets
+.env
+.env.local
+
+# Local Database & Cache (SQLite removed)
 attendance.db
-dataset/*
-!.gitkeep
-.streamlit/
+attendance.db-journal
+
+# Temporary Uploads & Datasets
+temp/
+dataset/
+data/faiss/*.index
+
+# OS generated files
+Thumbs.db
+.DS_Store
+
+# Build artifacts
+build/
+dist/
+

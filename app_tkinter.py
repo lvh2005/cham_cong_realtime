@@ -1,15 +1,14 @@
 """
 Face Attendance Desktop Application (Tkinter GUI)
-Hệ thống chấm công bằng nhận diện khuôn mặt
-Hỗ trợ SQLite & Microsoft SQL Server
+Hệ thống chấm công bằng nhận diện khuôn mặt Realtime
+Kiến trúc: Tkinter + OpenCV + face_recognition + FAISS + SQL Server + Cloudinary
+Quy mô: 10.000+ nhân viên (30.000 - 50.000 face vectors)
 """
 
-import json
-import os
-import shutil
 import threading
 import time
-from datetime import date, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import List, Optional
@@ -19,37 +18,40 @@ import numpy as np
 import pandas as pd
 from PIL import Image, ImageTk
 
-from attendance import COOLDOWN_SECONDS, get_attendance_report, register_attendance
+import config
+from attendance import get_attendance_report, register_attendance
+from auth_utils import change_admin_password, verify_admin_login
+from cloudinary_utils import delete_employee_avatar, upload_employee_avatar
 from database import (
+    activate_employee,
     add_employee,
-    delete_employee,
+    add_face_embeddings,
     get_available_sqlserver_drivers,
     get_employee,
     get_employees,
+    get_employees_with_stats,
+    hard_delete_employee,
     init_db,
-    load_all_face_encodings,
     load_db_config,
     save_db_config,
+    soft_delete_employee,
     test_db_connection,
+    update_employee_face,
 )
-from auth_utils import change_admin_password, verify_admin_login
+from faiss_utils import get_faiss_engine
 from face_utils import (
-    build_employee_encoding,
-    ensure_rgb_uint8,
-    load_known_faces,
+    build_employee_embeddings,
     recognize_faces,
+    recognize_faces_detailed,
 )
 from voice_utils import speak_async
-
-DATASET_DIR = "dataset"
-os.makedirs(DATASET_DIR, exist_ok=True)
 
 
 class CameraGrabber:
     """
     Luồng độc lập chạy ngầm đọc frame từ webcam (Non-blocking).
     Tách biệt hoàn toàn việc đọc phần cứng camera ra khỏi Main Thread của Tkinter,
-    giúp giao diện đạt 30+ FPS siêu mượt, không bao giờ bị Not Responding hay giật lag.
+    sử dụng MJPG 640x480 @ 30 FPS để đạt 0ms trễ phần cứng, giao diện siêu mượt 30-60 FPS.
     """
     def __init__(self, src: int = 0):
         self.src = src
@@ -63,7 +65,6 @@ class CameraGrabber:
         if self.running:
             return True
         try:
-            # Ưu tiên cv2.CAP_DSHOW trên Windows để bật camera tức thì và không bị buffer trễ
             self.cap = cv2.VideoCapture(self.src, cv2.CAP_DSHOW)
             if not self.cap or not self.cap.isOpened():
                 self.cap = cv2.VideoCapture(self.src)
@@ -71,7 +72,16 @@ class CameraGrabber:
             if not self.cap or not self.cap.isOpened():
                 return False
 
+            # Cấu hình MJPG + 640x480 + 30 FPS + Buffer 1 để loại bỏ hoàn toàn độ trễ phần cứng
+            try:
+                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            except Exception:
+                pass
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.cap.set(cv2.CAP_PROP_FPS, 30)
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
             self.running = True
             self.thread = threading.Thread(target=self._worker, daemon=True)
             self.thread.start()
@@ -87,7 +97,7 @@ class CameraGrabber:
                 with self.lock:
                     self.latest_frame = frame
             else:
-                time.sleep(0.01)
+                time.sleep(0.005)
 
     def get_frame(self) -> Optional[np.ndarray]:
         with self.lock:
@@ -113,7 +123,7 @@ class FaceAttendanceApp(tk.Tk):
     def __init__(self):
         super().__init__()
 
-        self.title("Face Attendance System • Hệ Thống Chấm Công Khuôn Mặt")
+        self.title("Face Attendance System • Hệ Thống Chấm Công AI (FAISS + SQL Server)")
 
         # Căn giữa màn hình
         win_w, win_h = 1260, 800
@@ -124,11 +134,8 @@ class FaceAttendanceApp(tk.Tk):
         self.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
         self.minsize(1080, 680)
 
-        # Trạng thái toàn cục (khởi tạo nhanh rỗng, tải dữ liệu sau)
-        self.known_faces = {"encodings": [], "codes": [], "names": []}
+        # Trạng thái toàn cục
         self.active_tab = "realtime"
-
-        # Phân quyền người dùng (Mặc định: Nhân viên / Kiosk Chấm công)
         self.is_admin = False
         self.current_admin_user = None
         self.ADMIN_TABS = {"dashboard", "register", "history", "export", "employees", "database"}
@@ -137,16 +144,19 @@ class FaceAttendanceApp(tk.Tk):
         self.reg_grabber = CameraGrabber(0)
         self.rec_grabber = CameraGrabber(0)
 
+        # ThreadPoolExecutor cho các tác vụ I/O chạy ngầm (Attendance, DB, Voice)
+        self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="AttendanceIO")
+
         # Biến cho chức năng Đăng ký
         self.register_photos: List[np.ndarray] = []
         self.reg_cam_running = False
 
         # Biến cho chức năng Chấm công Realtime
         self.rec_cam_running = False
-        self.rec_tolerance = 0.50
+        self._detected_faces_lock = threading.Lock()
         self.last_detected_faces = []
-        self.recent_attendance_attempts = {}
-        self.recent_logs = []
+        self.recent_attendance_attempts = {}  # {employee_code: timestamp}
+        self.cached_employees_stats = []
 
         self._setup_theme()
         self._build_layout()
@@ -155,7 +165,7 @@ class FaceAttendanceApp(tk.Tk):
         # Bắt sự kiện đóng cửa sổ để giải phóng camera
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-        # Khởi tạo CSDL và nạp dữ liệu nền (Non-blocking để không bao giờ bị Not Responding)
+        # Khởi tạo CSDL và nạp dữ liệu FAISS nền
         self.after(100, self._async_init_system)
 
     def _async_init_system(self):
@@ -163,26 +173,30 @@ class FaceAttendanceApp(tk.Tk):
             try:
                 init_db()
             except Exception as e:
-                print(f"Lỗi khởi tạo CSDL nền: {e}")
+                print(f"Lỗi khởi tạo/migration CSDL SQL Server: {e}")
 
             try:
-                faces = load_known_faces()
-                self.known_faces = faces
+                engine = get_faiss_engine()
+                engine.init_engine()
             except Exception as e:
-                print(f"Lỗi tải face encodings: {e}")
+                print(f"Lỗi khởi động FAISS Engine: {e}")
 
             self.after(0, self.refresh_dashboard)
             self.after(0, self.update_db_badge)
 
+            def auto_start_if_realtime():
+                if self.active_tab == "realtime" and getattr(self, "var_auto_cam", None) and self.var_auto_cam.get():
+                    if not self.rec_cam_running:
+                        self.start_realtime_camera()
+
+            self.after(400, auto_start_if_realtime)
+
         threading.Thread(target=worker, daemon=True).start()
-
-
 
     def _setup_theme(self):
         self.style = ttk.Style(self)
         self.style.theme_use("clam")
 
-        # Bảng màu
         self.BG_DARK = "#0f172a"      # Slate 900
         self.SIDEBAR_BG = "#1e293b"  # Slate 800
         self.SIDEBAR_HOVER = "#334155"
@@ -192,13 +206,13 @@ class FaceAttendanceApp(tk.Tk):
         self.BORDER_COLOR = "#e2e8f0"
         self.PRIMARY_COLOR = "#2563eb"
         self.SUCCESS_COLOR = "#16a34a"
+        self.WARNING_COLOR = "#d97706"
         self.DANGER_COLOR = "#dc2626"
         self.TEXT_MAIN = "#1e293b"
         self.TEXT_MUTED = "#64748b"
 
         self.configure(bg=self.CONTENT_BG)
 
-        # Style cho Treeview
         self.style.configure(
             "Custom.Treeview",
             background="#ffffff",
@@ -223,7 +237,6 @@ class FaceAttendanceApp(tk.Tk):
             foreground=[("selected", "#1e3a8a")],
         )
 
-        # Style cho Button
         self.style.configure(
             "Primary.TButton",
             background=self.PRIMARY_COLOR,
@@ -232,10 +245,7 @@ class FaceAttendanceApp(tk.Tk):
             padding=(12, 6),
             relief="flat",
         )
-        self.style.map(
-            "Primary.TButton",
-            background=[("active", "#1d4ed8")],
-        )
+        self.style.map("Primary.TButton", background=[("active", "#1d4ed8")])
 
         self.style.configure(
             "Success.TButton",
@@ -245,10 +255,7 @@ class FaceAttendanceApp(tk.Tk):
             padding=(12, 6),
             relief="flat",
         )
-        self.style.map(
-            "Success.TButton",
-            background=[("active", "#15803d")],
-        )
+        self.style.map("Success.TButton", background=[("active", "#15803d")])
 
         self.style.configure(
             "Danger.TButton",
@@ -258,22 +265,17 @@ class FaceAttendanceApp(tk.Tk):
             padding=(12, 6),
             relief="flat",
         )
-        self.style.map(
-            "Danger.TButton",
-            background=[("active", "#b91c1c")],
-        )
+        self.style.map("Danger.TButton", background=[("active", "#b91c1c")])
 
     def _build_layout(self):
-        # Frame chính
         self.main_container = tk.Frame(self, bg=self.CONTENT_BG)
         self.main_container.pack(fill="both", expand=True)
 
-        # 1. Sidebar (bên trái)
+        # 1. Sidebar
         self.sidebar = tk.Frame(self.main_container, bg=self.SIDEBAR_BG, width=250)
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
 
-        # Logo / Tiêu đề Sidebar
         title_frame = tk.Frame(self.sidebar, bg=self.SIDEBAR_BG, pady=18)
         title_frame.pack(fill="x")
         lbl_logo = tk.Label(
@@ -286,17 +288,16 @@ class FaceAttendanceApp(tk.Tk):
         lbl_logo.pack(anchor="w", padx=20)
         lbl_sub = tk.Label(
             title_frame,
-            text="Hệ thống chấm công AI",
-            font=("Segoe UI", 9),
+            text="FAISS • SQL Server • Cloudinary",
+            font=("Segoe UI", 8),
             fg="#94a3b8",
             bg=self.SIDEBAR_BG,
         )
         lbl_sub.pack(anchor="w", padx=20, pady=(2, 0))
 
-        # Role Badge
         self.lbl_role_badge = tk.Label(
             title_frame,
-            text="🟢 Nhân viên (Chấm công)",
+            text="🟢 Chế độ: Chấm công (Kiosk)",
             font=("Segoe UI", 8, "bold"),
             fg="#6ee7b7",
             bg="#064e3b",
@@ -305,7 +306,6 @@ class FaceAttendanceApp(tk.Tk):
         )
         self.lbl_role_badge.pack(anchor="w", padx=20, pady=(6, 0))
 
-        # Divider
         tk.Frame(self.sidebar, bg="#334155", height=1).pack(fill="x", padx=15, pady=5)
 
         # Menu buttons
@@ -342,10 +342,9 @@ class FaceAttendanceApp(tk.Tk):
             btn.pack(fill="x", pady=1)
             self.nav_buttons[key] = btn
 
-        # Divider
         tk.Frame(self.sidebar, bg="#334155", height=1).pack(fill="x", padx=15, pady=5)
 
-        # Khung nút chức năng Admin (Đăng nhập / Đổi mật khẩu / Đăng xuất)
+        # Khung xác thực Admin
         self.auth_frame = tk.Frame(self.sidebar, bg=self.SIDEBAR_BG, pady=6, padx=15)
         self.auth_frame.pack(fill="x")
 
@@ -381,6 +380,21 @@ class FaceAttendanceApp(tk.Tk):
         )
         self.btn_change_pwd.pack(fill="x", pady=(0, 4))
 
+        self.btn_rebuild_faiss = tk.Button(
+            self.admin_logged_frame,
+            text="⚡ Rebuild FAISS Index",
+            font=("Segoe UI", 8),
+            fg="#fef08a",
+            bg="#854d0e",
+            activebackground="#a16207",
+            activeforeground="#ffffff",
+            relief="flat",
+            pady=4,
+            cursor="hand2",
+            command=self.rebuild_faiss_manually,
+        )
+        self.btn_rebuild_faiss.pack(fill="x", pady=(0, 4))
+
         self.btn_admin_logout = tk.Button(
             self.admin_logged_frame,
             text="🔒 Đăng xuất Quản trị",
@@ -396,29 +410,28 @@ class FaceAttendanceApp(tk.Tk):
         )
         self.btn_admin_logout.pack(fill="x")
 
-        # Bottom Info Badge in Sidebar
+        # Bottom Info Badge
         bottom_frame = tk.Frame(self.sidebar, bg="#0f172a", pady=10, padx=15)
         bottom_frame.pack(side="bottom", fill="x")
 
         self.lbl_db_status = tk.Label(
             bottom_frame,
-            text="🟢 DB: SQLite",
+            text="🟢 DB: SQL Server",
             font=("Segoe UI", 9, "bold"),
             fg="#4ade80",
             bg="#0f172a",
         )
         self.lbl_db_status.pack(anchor="w")
 
-        lbl_ver = tk.Label(
+        self.lbl_faiss_status = tk.Label(
             bottom_frame,
-            text="Face Recognition v1.3 • OpenCV",
+            text="⚡ FAISS: 0 vectors",
             font=("Segoe UI", 8),
-            fg="#64748b",
+            fg="#94a3b8",
             bg="#0f172a",
         )
-        lbl_ver.pack(anchor="w", pady=(1, 6))
+        self.lbl_faiss_status.pack(anchor="w", pady=(1, 6))
 
-        # Nút Thoát ứng dụng
         btn_exit = tk.Button(
             bottom_frame,
             text="🚪 Thoát ứng dụng",
@@ -434,11 +447,10 @@ class FaceAttendanceApp(tk.Tk):
         )
         btn_exit.pack(fill="x")
 
-        # 2. Vùng Content (bên phải)
+        # 2. Content Area
         self.content_area = tk.Frame(self.main_container, bg=self.CONTENT_BG)
         self.content_area.pack(side="right", fill="both", expand=True, padx=25, pady=20)
 
-        # Dictionary lưu các frame tab
         self.tabs = {}
         self._init_realtime_tab()
         self._init_dashboard_tab()
@@ -451,7 +463,6 @@ class FaceAttendanceApp(tk.Tk):
         self.update_sidebar_auth_state()
 
     def update_sidebar_auth_state(self):
-        """Cập nhật trạng thái hiển thị của Sidebar theo quyền Admin / Nhân viên."""
         if self.is_admin:
             u = self.current_admin_user or "admin"
             self.lbl_role_badge.config(
@@ -467,7 +478,7 @@ class FaceAttendanceApp(tk.Tk):
                     self.nav_buttons[key].config(text=base_text)
         else:
             self.lbl_role_badge.config(
-                text="🟢 Nhân viên (Chấm công)",
+                text="🟢 Chế độ: Chấm công (Kiosk)",
                 bg="#064e3b",
                 fg="#6ee7b7",
             )
@@ -480,7 +491,6 @@ class FaceAttendanceApp(tk.Tk):
                     self.nav_buttons[key].config(text=text)
 
     def open_admin_login_dialog(self, target_tab: Optional[str] = None):
-        """Hộp thoại đăng nhập dành cho Quản trị viên."""
         dialog = tk.Toplevel(self)
         dialog.title("🔐 Đăng nhập Quản trị viên (Admin)")
         dialog.geometry("420x330")
@@ -488,13 +498,11 @@ class FaceAttendanceApp(tk.Tk):
         dialog.transient(self)
         dialog.grab_set()
 
-        # Căn giữa cửa sổ con
         x = self.winfo_x() + max(0, (self.winfo_width() - 420) // 2)
         y = self.winfo_y() + max(0, (self.winfo_height() - 330) // 2)
         dialog.geometry(f"+{x}+{y}")
         dialog.configure(bg="#ffffff")
 
-        # Header
         hdr = tk.Frame(dialog, bg="#1e293b", pady=15, padx=20)
         hdr.pack(fill="x")
         tk.Label(hdr, text="🔐 Đăng nhập Quản trị viên", font=("Segoe UI", 13, "bold"), fg="#ffffff", bg="#1e293b").pack(anchor="w")
@@ -574,7 +582,6 @@ class FaceAttendanceApp(tk.Tk):
         ent_pass.focus_set()
 
     def open_change_password_dialog(self):
-        """Hộp thoại đổi mật khẩu tài khoản Quản trị viên."""
         dialog = tk.Toplevel(self)
         dialog.title("🔑 Đổi mật khẩu Quản trị viên")
         dialog.geometry("400x340")
@@ -650,7 +657,6 @@ class FaceAttendanceApp(tk.Tk):
         ent_old.focus_set()
 
     def admin_logout(self):
-        """Đăng xuất quyền Admin và quay về chế độ chấm công của nhân viên."""
         confirm = messagebox.askyesno("Đăng xuất Quản trị", "Bạn có chắc chắn muốn đăng xuất khỏi quyền Quản trị viên?")
         if confirm:
             self.is_admin = False
@@ -659,47 +665,49 @@ class FaceAttendanceApp(tk.Tk):
             self.show_tab("realtime")
             messagebox.showinfo("Thông báo", "Đã đăng xuất! Ứng dụng đã chuyển về chế độ Chấm công nhân viên.")
 
+    def rebuild_faiss_manually(self):
+        def worker():
+            try:
+                engine = get_faiss_engine()
+                engine.rebuild_from_database()
+                count = engine.index.ntotal if engine.index else 0
+                self.after(0, lambda: messagebox.showinfo("FAISS Rebuild", f"✅ Đã Rebuild thành công FAISS Index!\nTổng số vectors: {count}"))
+                self.after(0, self.update_db_badge)
+            except Exception as e:
+                self.after(0, lambda err=str(e): messagebox.showerror("Lỗi FAISS", f"Không thể rebuild FAISS: {err}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def confirm_exit_app(self):
-        """Hỏi xác nhận và đóng ứng dụng an toàn."""
         confirm = messagebox.askyesno("Thoát ứng dụng", "Bạn có chắc chắn muốn thoát khỏi ứng dụng Chấm công không?")
         if confirm:
             self.on_closing()
 
     def update_db_badge(self):
-        cfg = load_db_config()
-        db_type = cfg.get("db_type", "sqlite").upper()
-
         def worker():
             ok, _ = test_db_connection()
+            engine = get_faiss_engine()
+            vector_count = engine.index.ntotal if engine.index else 0
+
             def apply():
                 try:
                     if ok:
-                        self.lbl_db_status.config(text=f"🟢 DB: {db_type}", fg="#4ade80")
+                        self.lbl_db_status.config(text="🟢 DB: SQL Server", fg="#4ade80")
                     else:
-                        self.lbl_db_status.config(text=f"🔴 DB: {db_type} (Lỗi)", fg="#f87171")
+                        self.lbl_db_status.config(text="🔴 DB: SQL Server (Lỗi)", fg="#f87171")
+                    self.lbl_faiss_status.config(text=f"⚡ FAISS: {vector_count:,} vectors")
                 except Exception:
                     pass
+
             self.after(0, apply)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def reload_faces(self):
-        """Tải lại danh sách encoding vào bộ nhớ RAM (chạy ngầm)."""
-        def worker():
-            try:
-                faces = load_known_faces()
-                self.known_faces = faces
-            except Exception as e:
-                print(f"Lỗi tải lại faces: {e}")
-        threading.Thread(target=worker, daemon=True).start()
-
     def show_tab(self, tab_key: str):
-        # Kiểm tra phân quyền: Nếu tab yêu cầu quyền Admin mà chưa đăng nhập
         if tab_key in self.ADMIN_TABS and not self.is_admin:
             self.open_admin_login_dialog(target_tab=tab_key)
             return
 
-        # Dừng camera các tab khác nếu đang chuyển
         if self.active_tab == "register" and tab_key != "register":
             self.stop_register_camera()
         if self.active_tab == "realtime" and tab_key != "realtime":
@@ -707,23 +715,26 @@ class FaceAttendanceApp(tk.Tk):
 
         self.active_tab = tab_key
 
-        # Highlight nút menu
         for key, btn in self.nav_buttons.items():
             if key == tab_key:
                 btn.config(bg=self.SIDEBAR_ACTIVE, fg="#ffffff", font=("Segoe UI", 10, "bold"))
             else:
                 btn.config(bg=self.SIDEBAR_BG, fg="#e2e8f0", font=("Segoe UI", 10))
 
-        # Hiển thị frame tương ứng
         for key, frame in self.tabs.items():
             if key == tab_key:
                 frame.pack(fill="both", expand=True)
             else:
                 frame.pack_forget()
 
-        # Gọi hàm refresh dữ liệu nếu cần
         if tab_key == "dashboard":
             self.refresh_dashboard()
+        elif tab_key == "register":
+            self.refresh_register_employees_dropdown()
+        elif tab_key == "realtime":
+            if getattr(self, "var_auto_cam", None) and self.var_auto_cam.get():
+                if not self.rec_cam_running:
+                    self.after(200, self.start_realtime_camera)
         elif tab_key == "history":
             self.filter_history()
         elif tab_key == "employees":
@@ -740,7 +751,6 @@ class FaceAttendanceApp(tk.Tk):
         tab = tk.Frame(self.content_area, bg=self.CONTENT_BG)
         self.tabs["dashboard"] = tab
 
-        # Tiêu đề
         lbl_h = tk.Label(
             tab,
             text="📊 Tổng quan hệ thống",
@@ -750,11 +760,10 @@ class FaceAttendanceApp(tk.Tk):
         )
         lbl_h.pack(anchor="w", pady=(0, 15))
 
-        # Khối thẻ thống kê (Metric Cards)
         cards_frame = tk.Frame(tab, bg=self.CONTENT_BG)
         cards_frame.pack(fill="x", pady=(0, 20))
 
-        self.card_total_emp = self._create_metric_card(cards_frame, "Tổng số nhân viên", "0", "#3b82f6")
+        self.card_total_emp = self._create_metric_card(cards_frame, "Tổng nhân viên (Active)", "0", "#3b82f6")
         self.card_total_emp.pack(side="left", fill="both", expand=True, padx=(0, 10))
 
         self.card_today_checkin = self._create_metric_card(cards_frame, "Có chấm công hôm nay", "0", "#10b981")
@@ -763,7 +772,6 @@ class FaceAttendanceApp(tk.Tk):
         self.card_today_completed = self._create_metric_card(cards_frame, "Đã có giờ ra (Check-out)", "0", "#8b5cf6")
         self.card_today_completed.pack(side="left", fill="both", expand=True, padx=(10, 0))
 
-        # Bảng dữ liệu hôm nay
         table_container = tk.Frame(tab, bg=self.CARD_BG, highlightbackground=self.BORDER_COLOR, highlightthickness=1)
         table_container.pack(fill="both", expand=True)
 
@@ -791,7 +799,6 @@ class FaceAttendanceApp(tk.Tk):
         )
         btn_refresh.pack(side="right")
 
-        # Treeview
         columns = ("emp_code", "full_name", "date", "in_time", "out_time", "hours")
         self.dash_tree = ttk.Treeview(
             table_container,
@@ -830,7 +837,7 @@ class FaceAttendanceApp(tk.Tk):
     def refresh_dashboard(self):
         def worker():
             try:
-                employees = get_employees()
+                employees = get_employees(status="ACTIVE")
                 total_emp = len(employees)
 
                 today = date.today()
@@ -853,9 +860,9 @@ class FaceAttendanceApp(tk.Tk):
 
                 def apply():
                     try:
-                        self.card_total_emp.val_label.config(text=str(total_emp))
-                        self.card_today_checkin.val_label.config(text=str(checked_in))
-                        self.card_today_completed.val_label.config(text=str(completed))
+                        self.card_total_emp.val_label.config(text=f"{total_emp:,}")
+                        self.card_today_checkin.val_label.config(text=f"{checked_in:,}")
+                        self.card_today_completed.val_label.config(text=f"{completed:,}")
 
                         for item in self.dash_tree.get_children():
                             self.dash_tree.delete(item)
@@ -871,9 +878,8 @@ class FaceAttendanceApp(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-
     # ==========================================
-    # 2. TAB: ĐĂNG KÝ NHÂN VIÊN
+    # 2. TAB: ĐĂNG KÝ & CẬP NHẬT KHUÔN MẶT NHÂN VIÊN
     # ==========================================
     def _init_register_tab(self):
         tab = tk.Frame(self.content_area, bg=self.CONTENT_BG)
@@ -881,47 +887,79 @@ class FaceAttendanceApp(tk.Tk):
 
         lbl_h = tk.Label(
             tab,
-            text="👤 Đăng ký nhân viên mới",
-            font=("Segoe UI", 18, "bold"),
+            text="👤 Đăng ký & Cập nhật khuôn mặt nhân viên (Đa Face Embeddings & Cloudinary)",
+            font=("Segoe UI", 17, "bold"),
             fg=self.TEXT_MAIN,
             bg=self.CONTENT_BG,
         )
-        lbl_h.pack(anchor="w", pady=(0, 15))
+        lbl_h.pack(anchor="w", pady=(0, 12))
 
         content_grid = tk.Frame(tab, bg=self.CONTENT_BG)
         content_grid.pack(fill="both", expand=True)
 
-        # Cột trái: Form nhập & Video Preview
-        left_col = tk.Frame(content_grid, bg=self.CARD_BG, highlightbackground=self.BORDER_COLOR, highlightthickness=1, padx=20, pady=20)
+        left_col = tk.Frame(content_grid, bg=self.CARD_BG, highlightbackground=self.BORDER_COLOR, highlightthickness=1, padx=18, pady=15)
         left_col.pack(side="left", fill="both", expand=True, padx=(0, 10))
 
-        # Form fields
         form_frame = tk.Frame(left_col, bg=self.CARD_BG)
-        form_frame.pack(fill="x", pady=(0, 10))
+        form_frame.pack(fill="x", pady=(0, 8))
 
-        tk.Label(form_frame, text="Mã nhân viên:", font=("Segoe UI", 10, "bold"), bg=self.CARD_BG).grid(row=0, column=0, sticky="w", pady=5)
-        self.ent_reg_code = ttk.Entry(form_frame, font=("Segoe UI", 10), width=20)
-        self.ent_reg_code.grid(row=0, column=1, sticky="w", padx=10, pady=5)
+        # Hàng 0: Chọn nhân viên có sẵn trong CSDL
+        tk.Label(form_frame, text="Chọn nhân viên:", font=("Segoe UI", 9, "bold"), bg=self.CARD_BG, fg=self.PRIMARY_COLOR).grid(row=0, column=0, sticky="w", pady=4)
+        self.cb_reg_select_emp = ttk.Combobox(form_frame, font=("Segoe UI", 9), width=32, state="readonly")
+        self.cb_reg_select_emp.grid(row=0, column=1, columnspan=2, sticky="we", padx=(10, 5), pady=4)
+        self.cb_reg_select_emp.bind("<<ComboboxSelected>>", self.on_reg_employee_selected)
 
-        tk.Label(form_frame, text="Họ và tên:", font=("Segoe UI", 10, "bold"), bg=self.CARD_BG).grid(row=1, column=0, sticky="w", pady=5)
-        self.ent_reg_name = ttk.Entry(form_frame, font=("Segoe UI", 10), width=30)
-        self.ent_reg_name.grid(row=1, column=1, sticky="w", padx=10, pady=5)
+        btn_reload_emp = ttk.Button(form_frame, text="🔄 Tải lại DS", command=self.refresh_register_employees_dropdown)
+        btn_reload_emp.grid(row=0, column=3, sticky="w", padx=5, pady=4)
+
+        # Hàng 1: Mã NV và Họ tên
+        tk.Label(form_frame, text="Mã nhân viên (*):", font=("Segoe UI", 9, "bold"), bg=self.CARD_BG).grid(row=1, column=0, sticky="w", pady=4)
+        self.ent_reg_code = ttk.Entry(form_frame, font=("Segoe UI", 9), width=16)
+        self.ent_reg_code.grid(row=1, column=1, sticky="w", padx=10, pady=4)
+        self.ent_reg_code.bind("<KeyRelease>", self.on_reg_code_changed)
+
+        tk.Label(form_frame, text="Họ và tên (*):", font=("Segoe UI", 9, "bold"), bg=self.CARD_BG).grid(row=1, column=2, sticky="w", padx=(10, 0), pady=4)
+        self.ent_reg_name = ttk.Entry(form_frame, font=("Segoe UI", 9), width=22)
+        self.ent_reg_name.grid(row=1, column=3, sticky="w", padx=10, pady=4)
+
+        # Hàng 2: Phòng ban và Chức vụ
+        tk.Label(form_frame, text="Phòng ban:", font=("Segoe UI", 9), bg=self.CARD_BG).grid(row=2, column=0, sticky="w", pady=4)
+        self.ent_reg_dept = ttk.Entry(form_frame, font=("Segoe UI", 9), width=16)
+        self.ent_reg_dept.grid(row=2, column=1, sticky="w", padx=10, pady=4)
+
+        tk.Label(form_frame, text="Chức vụ:", font=("Segoe UI", 9), bg=self.CARD_BG).grid(row=2, column=2, sticky="w", padx=(10, 0), pady=4)
+        self.ent_reg_pos = ttk.Entry(form_frame, font=("Segoe UI", 9), width=22)
+        self.ent_reg_pos.grid(row=2, column=3, sticky="w", padx=10, pady=4)
+
+        # Hàng 3: Banner trạng thái chế độ
+        self.lbl_reg_mode_status = tk.Label(
+            form_frame,
+            text="✨ [Tạo mới] Đăng ký nhân viên mới hoặc chọn từ danh sách trên để cập nhật.",
+            font=("Segoe UI", 9),
+            bg="#f0fdf4",
+            fg="#166534",
+            padx=10,
+            pady=4,
+            relief="groove",
+            anchor="w",
+        )
+        self.lbl_reg_mode_status.grid(row=3, column=0, columnspan=4, sticky="we", padx=2, pady=(6, 2))
 
         # Video Frame
         self.lbl_reg_video = tk.Label(
             left_col,
-            text="Camera đang tắt\nBấm 'Bật Camera' để chụp ảnh",
+            text="Camera đang tắt\nBấm 'Bật Camera' để chụp 3-5 góc mặt",
             font=("Segoe UI", 11),
             bg="#1e293b",
             fg="#94a3b8",
             width=50,
-            height=16,
+            height=15,
         )
-        self.lbl_reg_video.pack(fill="both", expand=True, pady=10)
+        self.lbl_reg_video.pack(fill="both", expand=True, pady=8)
 
         # Button Controls
         btn_box = tk.Frame(left_col, bg=self.CARD_BG)
-        btn_box.pack(fill="x", pady=5)
+        btn_box.pack(fill="x", pady=4)
 
         self.btn_reg_cam_toggle = ttk.Button(
             btn_box,
@@ -929,7 +967,7 @@ class FaceAttendanceApp(tk.Tk):
             style="Primary.TButton",
             command=self.toggle_register_camera,
         )
-        self.btn_reg_cam_toggle.pack(side="left", padx=5)
+        self.btn_reg_cam_toggle.pack(side="left", padx=4)
 
         self.btn_reg_capture = ttk.Button(
             btn_box,
@@ -937,30 +975,30 @@ class FaceAttendanceApp(tk.Tk):
             style="Primary.TButton",
             command=self.capture_register_photo,
         )
-        self.btn_reg_capture.pack(side="left", padx=5)
+        self.btn_reg_capture.pack(side="left", padx=4)
 
         btn_upload = ttk.Button(
             btn_box,
             text="📁 Chọn file ảnh",
             command=self.upload_register_photos,
         )
-        btn_upload.pack(side="left", padx=5)
+        btn_upload.pack(side="left", padx=4)
 
         btn_clear = ttk.Button(
             btn_box,
             text="🗑️ Xóa hết ảnh",
             command=self.clear_register_photos,
         )
-        btn_clear.pack(side="left", padx=5)
+        btn_clear.pack(side="left", padx=4)
 
-        # Cột phải: Danh sách ảnh đã chụp & Lưu hồ sơ
-        right_col = tk.Frame(content_grid, bg=self.CARD_BG, highlightbackground=self.BORDER_COLOR, highlightthickness=1, padx=20, pady=20, width=380)
+        # Cột phải: Thumbnails & Save
+        right_col = tk.Frame(content_grid, bg=self.CARD_BG, highlightbackground=self.BORDER_COLOR, highlightthickness=1, padx=18, pady=18, width=380)
         right_col.pack(side="right", fill="both", padx=(10, 0))
         right_col.pack_propagate(False)
 
         self.lbl_photo_count = tk.Label(
             right_col,
-            text="Ảnh đã chụp: 0/8–10 ảnh",
+            text="Ảnh đã chụp: 0/5 ảnh",
             font=("Segoe UI", 12, "bold"),
             fg=self.PRIMARY_COLOR,
             bg=self.CARD_BG,
@@ -969,17 +1007,16 @@ class FaceAttendanceApp(tk.Tk):
 
         tk.Label(
             right_col,
-            text="Cần tối thiểu 5 ảnh có 1 mặt rõ nét, các góc chụp/biểu cảm hơi khác nhau.",
-            font=("Segoe UI", 9),
+            text="Hệ thống tạo 3-5 embeddings riêng biệt, tự động kiểm tra trùng khuôn mặt và lưu ảnh đại diện lên Cloudinary.",
+            font=("Segoe UI", 8),
             fg=self.TEXT_MUTED,
             bg=self.CARD_BG,
             wraplength=340,
             justify="left",
-        ).pack(anchor="w", pady=(2, 10))
+        ).pack(anchor="w", pady=(2, 8))
 
-        # Gallery Canvas hiển thị thumbnails
         thumb_container = tk.Frame(right_col, bg="#f1f5f9")
-        thumb_container.pack(fill="both", expand=True, pady=5)
+        thumb_container.pack(fill="both", expand=True, pady=4)
 
         self.thumb_canvas = tk.Canvas(thumb_container, bg="#f1f5f9", highlightthickness=0)
         self.thumb_scrollbar = ttk.Scrollbar(thumb_container, orient="vertical", command=self.thumb_canvas.yview)
@@ -995,16 +1032,162 @@ class FaceAttendanceApp(tk.Tk):
         self.thumb_canvas.pack(side="left", fill="both", expand=True)
         self.thumb_scrollbar.pack(side="right", fill="y")
 
-        # Tiến trình & Nút Lưu
         self.reg_progress = ttk.Progressbar(right_col, mode="indeterminate")
 
         self.btn_save_reg = ttk.Button(
             right_col,
-            text="💾 Encode & Lưu Nhân Viên",
+            text="💾 Tạo Vector, Kiểm Tra Trùng & Lưu",
             style="Success.TButton",
             command=self.save_employee_registration,
         )
-        self.btn_save_reg.pack(fill="x", pady=10)
+        self.btn_save_reg.pack(fill="x", pady=8)
+
+    def refresh_register_employees_dropdown(self):
+        def worker():
+            try:
+                employees = get_employees_with_stats(status=None)
+                self.cached_employees_stats = employees
+                options = ["➕ [Đăng ký nhân viên mới hoàn toàn]"]
+                for emp in employees:
+                    code = emp["employee_code"]
+                    name = emp["full_name"]
+                    cnt = emp["embedding_count"]
+                    if cnt == 0:
+                        options.append(f"[{code}] {name} — ⚠️ Chưa có khuôn mặt (Web Admin)")
+                    else:
+                        options.append(f"[{code}] {name} — ✅ {cnt} vectors")
+
+                def apply():
+                    try:
+                        curr = self.cb_reg_select_emp.get()
+                        self.cb_reg_select_emp["values"] = options
+                        if not curr or curr not in options:
+                            self.cb_reg_select_emp.current(0)
+                    except Exception:
+                        pass
+
+                self.after(0, apply)
+            except Exception as e:
+                print(f"Lỗi nạp danh sách nhân viên cho dropdown: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_reg_employee_selected(self, event=None):
+        sel = self.cb_reg_select_emp.get()
+        if not sel or sel.startswith("➕"):
+            self.ent_reg_code.delete(0, tk.END)
+            self.ent_reg_name.delete(0, tk.END)
+            self.ent_reg_dept.delete(0, tk.END)
+            self.ent_reg_pos.delete(0, tk.END)
+            self.lbl_reg_mode_status.config(
+                text="✨ [Tạo mới] Đăng ký nhân viên mới hoàn toàn vào SQL Server & FAISS.",
+                bg="#f0fdf4",
+                fg="#166534",
+            )
+            self.btn_save_reg.config(text="💾 Tạo Mới & Lưu Khuôn Mặt")
+            return
+
+        if sel.startswith("[") and "]" in sel:
+            code = sel[1:sel.index("]")].strip().upper()
+            self.load_employee_into_register(code, auto_switch_tab=False)
+
+    def on_reg_code_changed(self, event=None):
+        code = self.ent_reg_code.get().strip().upper()
+        if not code:
+            self.lbl_reg_mode_status.config(
+                text="✨ [Tạo mới] Nhập mã để tạo mới hoặc chọn nhân viên từ danh sách.",
+                bg="#f0fdf4",
+                fg="#166534",
+            )
+            self.btn_save_reg.config(text="💾 Tạo Mới & Lưu Khuôn Mặt")
+            return
+
+        matched_emp = next((e for e in getattr(self, "cached_employees_stats", []) if e["employee_code"].upper() == code), None)
+        if not matched_emp:
+            try:
+                matched_emp = get_employee(code)
+            except Exception:
+                matched_emp = None
+
+        if matched_emp:
+            current_name = self.ent_reg_name.get().strip()
+            if not current_name and matched_emp.get("full_name"):
+                self.ent_reg_name.delete(0, tk.END)
+                self.ent_reg_name.insert(0, matched_emp["full_name"])
+                self.ent_reg_dept.delete(0, tk.END)
+                self.ent_reg_dept.insert(0, matched_emp.get("department", ""))
+                self.ent_reg_pos.delete(0, tk.END)
+                self.ent_reg_pos.insert(0, matched_emp.get("position", ""))
+
+            cnt = matched_emp.get("embedding_count", 0)
+            if cnt == 0:
+                self.lbl_reg_mode_status.config(
+                    text=f"⚠️ [Chưa có khuôn mặt] Hồ sơ '{code}' đã có trên CSDL (Web Admin) • Sẵn sàng nạp vector!",
+                    bg="#fef3c7",
+                    fg="#92400e",
+                )
+                self.btn_save_reg.config(text="💾 Nạp Khuôn Mặt Cho Nhân Viên")
+            else:
+                self.lbl_reg_mode_status.config(
+                    text=f"🔄 [Đã có {cnt} vector] Nhân viên '{code}' • Chụp ảnh mới sẽ CẬP NHẬT thay thế khuôn mặt cũ.",
+                    bg="#eff6ff",
+                    fg="#1e40af",
+                )
+                self.btn_save_reg.config(text="💾 Cập Nhật Khuôn Mặt Mới")
+        else:
+            self.lbl_reg_mode_status.config(
+                text=f"✨ [Mã mới: {code}] Chưa có trong CSDL • Sẽ tạo mới hồ sơ và nạp khuôn mặt.",
+                bg="#f0fdf4",
+                fg="#166534",
+            )
+            self.btn_save_reg.config(text="💾 Tạo Mới & Lưu Khuôn Mặt")
+
+    def load_employee_into_register(self, code: str, auto_switch_tab: bool = True):
+        if auto_switch_tab:
+            self.show_tab("register")
+
+        emp = get_employee(code)
+        if not emp:
+            return
+
+        self.ent_reg_code.delete(0, tk.END)
+        self.ent_reg_code.insert(0, emp["employee_code"])
+
+        self.ent_reg_name.delete(0, tk.END)
+        self.ent_reg_name.insert(0, emp["full_name"])
+
+        self.ent_reg_dept.delete(0, tk.END)
+        self.ent_reg_dept.insert(0, emp.get("department", ""))
+
+        self.ent_reg_pos.delete(0, tk.END)
+        self.ent_reg_pos.insert(0, emp.get("position", ""))
+
+        stats_emp = next((e for e in getattr(self, "cached_employees_stats", []) if e["employee_code"].upper() == code.upper()), None)
+        cnt = stats_emp["embedding_count"] if stats_emp else 0
+
+        if cnt == 0:
+            self.lbl_reg_mode_status.config(
+                text=f"⚠️ [Chưa có khuôn mặt] Hồ sơ [{code}] '{emp['full_name']}' từ Web Admin • Sẵn sàng nạp vector!",
+                bg="#fef3c7",
+                fg="#92400e",
+            )
+            self.btn_save_reg.config(text="💾 Nạp Khuôn Mặt Cho Nhân Viên")
+        else:
+            self.lbl_reg_mode_status.config(
+                text=f"🔄 [Đã có {cnt} vector] Nhân viên [{code}] '{emp['full_name']}' • Chụp ảnh mới sẽ CẬP NHẬT thay thế khuôn mặt cũ.",
+                bg="#eff6ff",
+                fg="#1e40af",
+            )
+            self.btn_save_reg.config(text="💾 Cập Nhật Khuôn Mặt Mới")
+
+        if hasattr(self, "cb_reg_select_emp") and self.cb_reg_select_emp.get():
+            for val in self.cb_reg_select_emp["values"]:
+                if f"[{code}]" in val:
+                    self.cb_reg_select_emp.set(val)
+                    break
+
+        if not self.reg_cam_running:
+            self.start_register_camera()
 
     def toggle_register_camera(self):
         if self.reg_cam_running:
@@ -1026,14 +1209,13 @@ class FaceAttendanceApp(tk.Tk):
         self.reg_cam_running = False
         self.reg_grabber.stop()
         self.btn_reg_cam_toggle.config(text="▶ Bật Camera")
-        self.lbl_reg_video.config(image="", text="Camera đang tắt\nBấm 'Bật Camera' để chụp ảnh")
+        self.lbl_reg_video.config(image="", text="Camera đang tắt\nBấm 'Bật Camera' để chụp 3-5 góc mặt")
 
     def _update_register_camera_feed(self):
         if not self.reg_cam_running:
             return
         frame = self.reg_grabber.get_frame()
         if frame is not None:
-            # Resize frame để vừa khung giao diện
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w = frame_rgb.shape[:2]
             target_w = 480
@@ -1073,13 +1255,11 @@ class FaceAttendanceApp(tk.Tk):
 
     def _update_thumbnails(self):
         count = len(self.register_photos)
-        self.lbl_photo_count.config(text=f"Ảnh đã chụp: {count}/8–10 ảnh")
+        self.lbl_photo_count.config(text=f"Ảnh đã chụp: {count}/5 ảnh (Tối thiểu 3)")
 
-        # Xóa widget cũ trong thumbnail frame
         for child in self.thumb_inner.winfo_children():
             child.destroy()
 
-        # Hiển thị thumbnails dạng grid (3 cột)
         cols = 3
         for i, photo_bgr in enumerate(self.register_photos):
             photo_rgb = cv2.cvtColor(photo_bgr, cv2.COLOR_BGR2RGB)
@@ -1101,72 +1281,153 @@ class FaceAttendanceApp(tk.Tk):
     def save_employee_registration(self):
         code = self.ent_reg_code.get().strip().upper()
         name = self.ent_reg_name.get().strip()
+        dept = self.ent_reg_dept.get().strip()
+        pos = self.ent_reg_pos.get().strip()
 
         if not code or not name:
             messagebox.showerror("Thiếu thông tin", "Vui lòng nhập đầy đủ Mã nhân viên và Họ tên.")
             return
 
-        if len(self.register_photos) < 5:
+        if len(self.register_photos) < 3:
             messagebox.showwarning(
                 "Chưa đủ ảnh",
-                f"Bạn mới chụp {len(self.register_photos)} ảnh. Vui lòng chụp tối thiểu 5 ảnh (khuyến nghị 8-10 ảnh).",
+                f"Bạn mới chụp {len(self.register_photos)} ảnh. Vui lòng chụp tối thiểu 3-5 ảnh có khuôn mặt rõ nét.",
             )
             return
 
-        if get_employee(code):
-            messagebox.showerror("Trùng mã", f"Mã nhân viên '{code}' đã tồn tại trong CSDL!")
-            return
+        # Kiểm tra xem nhân viên đã tồn tại trong CSDL chưa
+        existing_emp = get_employee(code)
+        is_update = existing_emp is not None
 
         self.btn_save_reg.config(state="disabled")
         self.reg_progress.pack(fill="x", pady=5)
         self.reg_progress.start()
 
-        # Chạy encode trong background thread để không lag giao diện
         def worker():
             try:
-                encoding = build_employee_encoding(self.register_photos, min_valid_photos=3)
-                if encoding is None:
+                # 1. Tạo danh sách các vector embeddings riêng lẻ (float32)
+                embeddings, best_photo, best_box = build_employee_embeddings(self.register_photos, min_valid_photos=3)
+
+                if not embeddings or len(embeddings) < 3:
                     self.after(0, lambda: messagebox.showerror(
-                        "Lỗi Encode",
-                        "Không thể nhận diện khuôn mặt rõ nét từ các ảnh đã chụp.\n"
+                        "Lỗi Face Embeddings",
+                        "Không thể nhận diện đủ tối thiểu 3 ảnh có khuôn mặt rõ nét.\n"
                         "Vui lòng đảm bảo mỗi ảnh có đúng 1 khuôn mặt, đủ sáng và không bị che khuất."
                     ))
                     return
 
-                # Lưu ảnh vào thư mục dataset/MãNV
-                emp_dir = os.path.join(DATASET_DIR, code)
-                os.makedirs(emp_dir, exist_ok=True)
-                for idx, photo_bgr in enumerate(self.register_photos, start=1):
-                    file_path = os.path.join(emp_dir, f"{idx:02d}.jpg")
-                    cv2.imwrite(file_path, photo_bgr)
+                # 2. Kiểm tra trùng khuôn mặt bằng FAISS (Duplicate Face Detection)
+                # Nếu đang cập nhật -> loại trừ chính nhân viên này ra để không báo trùng với bản thân
+                engine = get_faiss_engine()
+                exclude_emp_id = existing_emp["id"] if is_update else None
+                is_dup, dup_info = engine.check_duplicate_face(
+                    embeddings,
+                    duplicate_threshold=config.FACE_DUPLICATE_THRESHOLD,
+                    exclude_employee_id=exclude_emp_id,
+                    exclude_employee_code=code,
+                )
 
-                # Lưu vào database
-                add_employee(code, name, encoding)
-                self.reload_faces()
+                if is_dup and dup_info is not None:
+                    dup_code = dup_info.get("employee_code", "")
+                    dup_name = dup_info.get("full_name", "")
+                    dup_dist = dup_info.get("distance", 0.0)
 
-                def on_success():
-                    messagebox.showinfo(
-                        "Thành công",
-                        f"Đã đăng ký thành công nhân viên:\n[{code}] {name}\nĐã lưu {len(self.register_photos)} ảnh và vector khuôn mặt vào CSDL.",
+                    self.after(0, lambda: messagebox.showwarning(
+                        "Cảnh báo: Khuôn mặt đã tồn tại!",
+                        f"⚠️ Khuôn mặt này có khả năng trùng với nhân viên khác trong hệ thống!\n\n"
+                        f"• Mã nhân viên trùng: {dup_code}\n"
+                        f"• Họ và tên: {dup_name}\n"
+                        f"• Khoảng cách sai số (Distance): {dup_dist:.3f}\n\n"
+                        f"Hệ thống từ chối lưu để ngăn ngừa trùng lặp dữ liệu.",
+                    ))
+                    return
+
+                # 3. Upload ảnh đại diện tốt nhất lên Cloudinary (nếu đã cấu hình)
+                image_url, cloudinary_pid = "", ""
+                if best_photo is not None:
+                    image_url, cloudinary_pid = upload_employee_avatar(code, best_photo, best_box)
+
+                if is_update:
+                    # CẬP NHẬT KHUÔN MẶT CHO NHÂN VIÊN ĐÃ TỒN TẠI (TẠO TỪ WEB ADMIN HOẶC CSDL)
+                    emp_id = existing_emp["id"]
+                    face_ids = update_employee_face(
+                        employee_id=emp_id,
+                        embeddings=embeddings,
+                        image_url=image_url,
+                        cloudinary_public_id=cloudinary_pid,
                     )
-                    self.ent_reg_code.delete(0, tk.END)
-                    self.ent_reg_name.delete(0, tk.END)
-                    self.clear_register_photos()
-                    self.stop_register_camera()
 
-                self.after(0, on_success)
+                    # Xóa vector cũ trong FAISS Index và nạp vector mới
+                    engine.remove_employee(emp_id)
+                    engine.add_embeddings(face_ids, embeddings, emp_id, code, name)
+
+                    def on_success_update():
+                        cloud_msg = "Đã cập nhật ảnh đại diện lên Cloudinary.\n" if image_url else ""
+                        messagebox.showinfo(
+                            "Cập nhật thành công!",
+                            f"✅ Đã nạp/cập nhật thành công khuôn mặt cho nhân viên:\n"
+                            f"• [{code}] {name}\n"
+                            f"• Đã nạp {len(face_ids)} vector khuôn mặt AI vào FAISS & SQL Server.\n"
+                            f"• {cloud_msg}"
+                            f"Nhân viên đã có thể bắt đầu chấm công nhận diện ngay!",
+                        )
+                        self.ent_reg_code.delete(0, tk.END)
+                        self.ent_reg_name.delete(0, tk.END)
+                        self.ent_reg_dept.delete(0, tk.END)
+                        self.ent_reg_pos.delete(0, tk.END)
+                        self.clear_register_photos()
+                        self.stop_register_camera()
+                        self.refresh_register_employees_dropdown()
+                        self.update_db_badge()
+
+                    self.after(0, on_success_update)
+                else:
+                    # TẠO MỚI NHÂN VIÊN
+                    emp_id = add_employee(
+                        employee_code=code,
+                        full_name=name,
+                        department=dept,
+                        position=pos,
+                        image_url=image_url,
+                        cloudinary_public_id=cloudinary_pid,
+                    )
+
+                    if emp_id <= 0:
+                        raise RuntimeError("Không thể tạo bản ghi nhân viên trong CSDL SQL Server.")
+
+                    face_ids = add_face_embeddings(emp_id, embeddings)
+                    engine.add_embeddings(face_ids, embeddings, emp_id, code, name)
+
+                    def on_success_new():
+                        cloud_msg = "Đã lưu ảnh đại diện lên Cloudinary.\n" if image_url else "Chưa cấu hình Cloudinary (ảnh lưu cục bộ).\n"
+                        messagebox.showinfo(
+                            "Đăng ký thành công!",
+                            f"✅ Đã thêm mới thành công nhân viên:\n"
+                            f"• [{code}] {name}\n"
+                            f"• Đã tạo & index {len(face_ids)} vector khuôn mặt vào FAISS.\n"
+                            f"• {cloud_msg}"
+                            f"• Đã dọn dẹp ảnh tạm thành công.",
+                        )
+                        self.ent_reg_code.delete(0, tk.END)
+                        self.ent_reg_name.delete(0, tk.END)
+                        self.ent_reg_dept.delete(0, tk.END)
+                        self.ent_reg_pos.delete(0, tk.END)
+                        self.clear_register_photos()
+                        self.stop_register_camera()
+                        self.refresh_register_employees_dropdown()
+                        self.update_db_badge()
+
+                    self.after(0, on_success_new)
+
             except Exception as ex:
                 err_msg = str(ex)
-                def show_err(msg=err_msg):
-                    messagebox.showerror("Lỗi khi lưu dữ liệu", f"Chi tiết lỗi: {msg}")
-                self.after(0, show_err)
+                self.after(0, lambda msg=err_msg: messagebox.showerror("Lỗi khi lưu nhân viên", f"Chi tiết lỗi: {msg}"))
             finally:
                 def reset_ui():
                     self.reg_progress.stop()
                     self.reg_progress.pack_forget()
                     self.btn_save_reg.config(state="normal")
                 self.after(0, reset_ui)
-
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1179,7 +1440,7 @@ class FaceAttendanceApp(tk.Tk):
 
         lbl_h = tk.Label(
             tab,
-            text="📷 Chấm công nhận diện khuôn mặt Realtime",
+            text="📷 Chấm công nhận diện khuôn mặt Realtime (FAISS O(1) Speed)",
             font=("Segoe UI", 18, "bold"),
             fg=self.TEXT_MAIN,
             bg=self.CONTENT_BG,
@@ -1189,11 +1450,9 @@ class FaceAttendanceApp(tk.Tk):
         content_grid = tk.Frame(tab, bg=self.CONTENT_BG)
         content_grid.pack(fill="both", expand=True)
 
-        # Cột trái: Camera Stream
         left_col = tk.Frame(content_grid, bg=self.CARD_BG, highlightbackground=self.BORDER_COLOR, highlightthickness=1, padx=15, pady=15)
         left_col.pack(side="left", fill="both", expand=True, padx=(0, 10))
 
-        # Controls bar
         top_ctrl = tk.Frame(left_col, bg=self.CARD_BG)
         top_ctrl.pack(fill="x", pady=(0, 10))
 
@@ -1206,10 +1465,10 @@ class FaceAttendanceApp(tk.Tk):
         self.btn_rec_toggle.pack(side="left", padx=(0, 10))
 
         tk.Label(top_ctrl, text="Độ nhạy:", font=("Segoe UI", 9), bg=self.CARD_BG).pack(side="left", padx=(0, 2))
-        self.scale_tol = ttk.Scale(top_ctrl, from_=0.35, to=0.65, value=0.50, orient="horizontal", length=90)
+        self.scale_tol = ttk.Scale(top_ctrl, from_=0.35, to=0.65, value=config.FACE_MATCH_THRESHOLD, orient="horizontal", length=90)
         self.scale_tol.pack(side="left", padx=2)
 
-        self.lbl_tol_val = tk.Label(top_ctrl, text="0.50", font=("Segoe UI", 9, "bold"), bg=self.CARD_BG, fg=self.PRIMARY_COLOR)
+        self.lbl_tol_val = tk.Label(top_ctrl, text=f"{config.FACE_MATCH_THRESHOLD:.2f}", font=("Segoe UI", 9, "bold"), bg=self.CARD_BG, fg=self.PRIMARY_COLOR)
         self.lbl_tol_val.pack(side="left", padx=(2, 10))
         self.scale_tol.configure(command=lambda v: self.lbl_tol_val.config(text=f"{float(v):.2f}"))
 
@@ -1224,10 +1483,11 @@ class FaceAttendanceApp(tk.Tk):
         )
         chk_voice.pack(side="left", padx=5)
 
-        self.var_auto_stop = tk.BooleanVar(value=True)
+        # Mặc định var_auto_stop = False để chấm công liên tục tự động
+        self.var_auto_stop = tk.BooleanVar(value=False)
         chk_autostop = tk.Checkbutton(
             top_ctrl,
-            text="⏹ Tự động kết thúc khi xong",
+            text="⏹ Tắt camera sau khi chấm công",
             variable=self.var_auto_stop,
             bg=self.CARD_BG,
             font=("Segoe UI", 9),
@@ -1235,7 +1495,17 @@ class FaceAttendanceApp(tk.Tk):
         )
         chk_autostop.pack(side="left", padx=5)
 
-        # Video canvas
+        self.var_auto_cam = tk.BooleanVar(value=True)
+        chk_autocam = tk.Checkbutton(
+            top_ctrl,
+            text="⚡ Tự động bật camera",
+            variable=self.var_auto_cam,
+            bg=self.CARD_BG,
+            font=("Segoe UI", 9),
+            activebackground=self.CARD_BG,
+        )
+        chk_autocam.pack(side="left", padx=5)
+
         self.lbl_rec_video = tk.Label(
             left_col,
             text="Camera đang tắt\nBấm 'Bắt đầu điểm danh' để nhận diện",
@@ -1247,7 +1517,6 @@ class FaceAttendanceApp(tk.Tk):
         )
         self.lbl_rec_video.pack(fill="both", expand=True, pady=5)
 
-        # Status Banner dưới camera
         self.rec_status_banner = tk.Label(
             left_col,
             text="Sẵn sàng điểm danh",
@@ -1258,7 +1527,6 @@ class FaceAttendanceApp(tk.Tk):
         )
         self.rec_status_banner.pack(fill="x", pady=(5, 0))
 
-        # Cột phải: Log sự kiện tức thì
         right_col = tk.Frame(content_grid, bg=self.CARD_BG, highlightbackground=self.BORDER_COLOR, highlightthickness=1, padx=15, pady=15, width=360)
         right_col.pack(side="right", fill="both", padx=(10, 0))
         right_col.pack_propagate(False)
@@ -1271,7 +1539,6 @@ class FaceAttendanceApp(tk.Tk):
             bg=self.CARD_BG,
         ).pack(anchor="w", pady=(0, 10))
 
-        # Log Treeview
         log_cols = ("time", "code", "name", "type")
         self.log_tree = ttk.Treeview(right_col, columns=log_cols, show="headings", style="Custom.Treeview")
         self.log_tree.heading("time", text="Thời gian")
@@ -1299,12 +1566,14 @@ class FaceAttendanceApp(tk.Tk):
         if self.rec_cam_running:
             return
 
-        # Luôn tải lại danh sách khuôn mặt mới nhất từ CSDL
-        self.known_faces = load_known_faces()
-        if not self.known_faces["encodings"]:
+        engine = get_faiss_engine()
+        if engine.index is None or engine.index.ntotal == 0:
+            engine.init_engine()
+
+        if engine.index is None or engine.index.ntotal == 0:
             messagebox.showwarning(
                 "Chưa có dữ liệu",
-                "Chưa có nhân viên nào có face encoding trong CSDL.\nVui lòng vào tab 'Đăng ký nhân viên' trước!",
+                "Chưa có nhân viên active nào trong FAISS Index.\nVui lòng vào tab 'Đăng ký nhân viên' trước!",
             )
             return
 
@@ -1313,116 +1582,155 @@ class FaceAttendanceApp(tk.Tk):
             return
 
         self.rec_cam_running = True
-        self.last_detected_faces = []
-        self.recent_attendance_attempts = {}
+        with self._detected_faces_lock:
+            self.last_detected_faces = []
+        self.recent_attendance_attempts.clear()
         self.btn_rec_toggle.config(text="⏹ Dừng Camera", style="Danger.TButton")
-        self.rec_status_banner.config(text="Camera đang hoạt động • Vui lòng nhìn thẳng vào ống kính", bg="#dbeafe", fg="#1e40af")
+        self.rec_status_banner.config(text="🟢 Camera đang hoạt động • Vui lòng nhìn thẳng vào ống kính", bg="#dbeafe", fg="#1e40af")
 
-        # 1. Khởi động AI Background Worker (xử lý nhận diện ngầm không lag UI)
+        # Khởi chạy Thread 2: AI Background Worker
         threading.Thread(target=self._realtime_ai_worker, daemon=True).start()
-
-        # 2. Khởi động vòng lặp render video mượt mà trên UI (30 FPS)
+        # Khởi chạy Thread 3: UI Main Thread render loop
         self._update_realtime_camera_feed()
 
     def stop_realtime_camera(self):
         self.rec_cam_running = False
         self.rec_grabber.stop()
-        self.last_detected_faces = []
+        with self._detected_faces_lock:
+            self.last_detected_faces = []
         self.btn_rec_toggle.config(text="▶ Bắt đầu điểm danh", style="Success.TButton")
         self.lbl_rec_video.config(image="", text="Camera đang tắt\nBấm 'Bắt đầu điểm danh' để nhận diện")
         self.rec_status_banner.config(text="Đã dừng nhận diện", bg="#f1f5f9", fg=self.TEXT_MUTED)
 
     def _realtime_ai_worker(self):
-        """Worker thread nhận diện khuôn mặt ngầm tách biệt hoàn toàn."""
+        """
+        Thread 2 - AI Worker:
+        Chạy ngầm liên tục, lấy frame mới nhất từ CameraGrabber, trích xuất vector và tìm kiếm FAISS.
+        - Tối ưu tải CPU: Xử lý frame ở scale_factor=0.5 (nhanh & cực nhạy).
+        - Độc lập 1-to-1: Mỗi khuôn mặt có danh tính riêng, không kế thừa dữ liệu của mặt bên cạnh.
+        - Bất đồng bộ hóa: Tác vụ ghi DB / loa được đẩy sang ThreadPoolExecutor, không làm nghẽn AI loop.
+        """
         while self.rec_cam_running:
             frame = self.rec_grabber.get_frame()
-            if frame is None or not self.known_faces["encodings"]:
-                time.sleep(0.04)
+            if frame is None:
+                time.sleep(0.01)
                 continue
 
             try:
                 try:
                     tolerance = float(self.scale_tol.get())
                 except Exception:
-                    tolerance = 0.50
+                    tolerance = config.FACE_MATCH_THRESHOLD
 
-                small = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
-                locations, names, codes, distances = recognize_faces(
-                    small,
-                    self.known_faces["encodings"],
-                    self.known_faces["names"],
-                    known_codes=self.known_faces["codes"],
+                # Nhận diện đa khuôn mặt chi tiết độc lập
+                detailed_faces = recognize_faces_detailed(
+                    frame=frame,
                     tolerance=tolerance,
+                    scale_factor=0.5,
+                    is_bgr=True,
                 )
 
                 new_faces = []
                 now_ts = time.time()
-                for (top, right, bottom, left), name, code, distance in zip(
-                    locations, names, codes, distances
-                ):
-                    top *= 2
-                    right *= 2
-                    bottom *= 2
-                    left *= 2
 
-                    if name != "Unknown" and code != "Unknown":
-                        color = (0, 255, 0)
-                        label = f"{code} - {name} ({distance:.2f})"
-                        # Debounce: chỉ gọi register_attendance nếu chưa gọi trong 6 giây gần nhất
-                        if now_ts - self.recent_attendance_attempts.get(code, 0) > 6.0:
+                for face in detailed_faces:
+                    top, right, bottom, left = face["box"]
+                    status = face["status"]
+                    code = face["code"]
+                    name = face["name"]
+                    dist = face["distance"]
+
+                    if status == "AMBIGUOUS":
+                        color = (0, 165, 255)  # Cam cảnh báo
+                        label = f"AMBIGUOUS ({dist:.2f})"
+                        self.after(0, lambda: self.rec_status_banner.config(
+                            text="⚠️ Không thể xác định chính xác nhân viên (AMBIGUOUS). Vui lòng xác minh thêm.",
+                            bg="#fef3c7",
+                            fg="#92400e",
+                        ))
+                    elif status == "MATCH" and code != "Unknown":
+                        color = (0, 255, 0)  # Xanh lá
+                        label = f"{code} - {name} ({dist:.2f})"
+
+                        # Kiểm tra Cooldown độc lập từng nhân viên trước khi kích hoạt
+                        last_attempt = self.recent_attendance_attempts.get(code, 0.0)
+                        if (now_ts - last_attempt) >= config.ATTENDANCE_COOLDOWN_SECONDS:
                             self.recent_attendance_attempts[code] = now_ts
-                            res = register_attendance(code)
-                            if res and res.get("success"):
-                                self.after(0, lambda r=res: self._handle_attendance_result(r))
+                            # Đẩy tác vụ I/O sang ThreadPoolExecutor bất đồng bộ
+                            self.executor.submit(self._async_register_attendance_task, code, name)
                     else:
-                        color = (0, 0, 255)
+                        color = (0, 0, 255)  # Đỏ (Chưa đăng ký / Unknown)
                         label = "Unknown"
 
                     new_faces.append((top, right, bottom, left, label, color))
 
-                self.last_detected_faces = new_faces
-            except Exception as ex:
+                with self._detected_faces_lock:
+                    self.last_detected_faces = new_faces
+
+            except Exception:
                 pass
 
-            # Nghỉ 50ms giữa các lần nhận diện (~15 FPS nhận diện ngầm, giữ CPU mát mẻ)
-            time.sleep(0.05)
+            # Nghỉ nhẹ 25ms để nhường CPU cho luồng hiển thị giao diện đạt FPS tối đa
+            time.sleep(0.025)
+
+    def _async_register_attendance_task(self, employee_code: str, employee_name: str):
+        """
+        Background I/O Worker (ThreadPoolExecutor):
+        Thực hiện ghi nhận chấm công vào SQL Server độc lập, không chặn luồng Camera hay UI.
+        """
+        try:
+            res = register_attendance(employee_code)
+            if res and res.get("success"):
+                self.after(0, lambda r=res: self._handle_attendance_result(r))
+        except Exception as ex:
+            print(f"Lỗi ghi nhận chấm công bất đồng bộ ({employee_code}): {ex}")
 
     def _update_realtime_camera_feed(self):
-        """Render frame camera và vẽ bounding box trên luồng UI (30 FPS siêu mượt)."""
+        """
+        Thread 3 - UI Loop (Tkinter Main Thread):
+        Chỉ nhận frame và danh sách bounding box để vẽ đè lên canvas/label với tần số mượt mà (~40 FPS).
+        Tuyệt đối không chờ AI hay I/O mạng.
+        """
         if not self.rec_cam_running:
             return
 
         frame = self.rec_grabber.get_frame()
         if frame is not None:
-            # Vẽ các bounding box mới nhất lên frame
-            for (top, right, bottom, left, label, color) in list(self.last_detected_faces):
+            # Lấy bản sao an toàn của các bounding box từ AI Worker
+            with self._detected_faces_lock:
+                faces_to_draw = list(self.last_detected_faces)
+
+            for (top, right, bottom, left, label, color) in faces_to_draw:
+                # Vẽ viền bounding box
                 cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
-                cv2.rectangle(frame, (left, bottom - 30), (right, bottom), color, cv2.FILLED)
+                # Vẽ nền nhãn
+                cv2.rectangle(frame, (left, max(0, bottom - 26)), (right, bottom), color, cv2.FILLED)
+                # Vẽ chữ nhãn
+                text_color = (0, 0, 0) if color == (0, 255, 0) else (255, 255, 255)
                 cv2.putText(
                     frame,
                     label,
-                    (left + 6, bottom - 8),
+                    (left + 6, max(14, bottom - 7)),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 0, 0) if color == (0, 255, 0) else (255, 255, 255),
+                    0.55,
+                    text_color,
                     1,
                     cv2.LINE_AA,
                 )
 
-            # Chuyển đổi hiển thị lên Canvas
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w = frame_rgb.shape[:2]
             target_w = 640
             target_h = int(h * (target_w / w))
-            resized = cv2.resize(frame_rgb, (target_w, target_h))
-            img_pil = Image.fromarray(resized)
+            if target_w != w or target_h != h:
+                frame_rgb = cv2.resize(frame_rgb, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+
+            img_pil = Image.fromarray(frame_rgb)
             img_tk = ImageTk.PhotoImage(image=img_pil)
             self.lbl_rec_video.img_tk = img_tk
             self.lbl_rec_video.config(image=img_tk, text="")
 
-        self.after(30, self._update_realtime_camera_feed)
-
-
+        self.after(25, self._update_realtime_camera_feed)
 
     def _handle_attendance_result(self, res: dict):
         if not res:
@@ -1438,15 +1746,12 @@ class FaceAttendanceApp(tk.Tk):
             fg_color = "#166534" if att_type == "CHECK-IN" else "#92400e"
 
             self.rec_status_banner.config(text=banner_text, bg=bg_color, fg=fg_color)
-
-            # Thêm vào bảng log
             self.log_tree.insert("", 0, values=(now_time, code, name, att_type))
 
-            # 1. Phát giọng nói: "Xin cảm ơn <Tên nhân viên>!"
+            # Phát giọng nói tiếng Việt bất đồng bộ (0ms UI lag)
             if getattr(self, "var_voice_enabled", None) and self.var_voice_enabled.get():
                 speak_async(employee_name=name)
 
-            # 2. Tự động kết thúc điểm danh nếu đang bật chế độ Tự động kết thúc
             if getattr(self, "var_auto_stop", None) and self.var_auto_stop.get():
                 def auto_finish():
                     if self.rec_cam_running:
@@ -1459,6 +1764,16 @@ class FaceAttendanceApp(tk.Tk):
                         self.refresh_dashboard()
 
                 self.after(1600, auto_finish)
+            else:
+                # Chế độ tự động liên tục: sau 2.5s đưa banner về trạng thái sẵn sàng đón người tiếp theo
+                def reset_status():
+                    if self.rec_cam_running:
+                        self.rec_status_banner.config(
+                            text="🟢 Camera đang hoạt động • Vui lòng nhìn thẳng vào ống kính để điểm danh",
+                            bg="#dbeafe",
+                            fg="#1e40af",
+                        )
+                self.after(2500, reset_status)
 
     # ==========================================
     # 4. TAB: LỊCH SỬ CHẤM CÔNG
@@ -1476,7 +1791,6 @@ class FaceAttendanceApp(tk.Tk):
         )
         lbl_h.pack(anchor="w", pady=(0, 15))
 
-        # Thanh lọc (Filter bar)
         filter_card = tk.Frame(tab, bg=self.CARD_BG, highlightbackground=self.BORDER_COLOR, highlightthickness=1, padx=15, pady=12)
         filter_card.pack(fill="x", pady=(0, 15))
 
@@ -1499,7 +1813,6 @@ class FaceAttendanceApp(tk.Tk):
         btn_filter = ttk.Button(filter_card, text="🔍 Tìm kiếm", style="Primary.TButton", command=self.filter_history)
         btn_filter.pack(side="left", padx=5)
 
-        # Bảng hiển thị kết quả
         table_container = tk.Frame(tab, bg=self.CARD_BG, highlightbackground=self.BORDER_COLOR, highlightthickness=1)
         table_container.pack(fill="both", expand=True)
 
@@ -1532,7 +1845,7 @@ class FaceAttendanceApp(tk.Tk):
 
         def worker():
             try:
-                employees = get_employees()
+                employees = get_employees(status=None)
                 emp_options = ["Tất cả"] + [f"{e['employee_code']} — {e['full_name']}" for e in employees]
 
                 df = get_attendance_report(
@@ -1571,13 +1884,9 @@ class FaceAttendanceApp(tk.Tk):
                 self.after(0, apply)
             except Exception as e:
                 err_text = str(e)
-                def show_err(msg=err_text):
-                    messagebox.showerror("Lỗi truy vấn", f"Không thể lấy dữ liệu lịch sử: {msg}")
-                self.after(0, show_err)
+                self.after(0, lambda msg=err_text: messagebox.showerror("Lỗi truy vấn", f"Không thể lấy dữ liệu lịch sử: {msg}"))
 
         threading.Thread(target=worker, daemon=True).start()
-
-
 
     # ==========================================
     # 5. TAB: XUẤT BÁO CÁO EXCEL
@@ -1648,7 +1957,6 @@ class FaceAttendanceApp(tk.Tk):
                 ws.freeze_panes = "A2"
                 ws.auto_filter.ref = ws.dimensions
 
-                # Tự động điều chỉnh độ rộng cột
                 for col in ws.columns:
                     max_len = max(len(str(cell.value or "")) for cell in col)
                     col_letter = col[0].column_letter
@@ -1667,58 +1975,92 @@ class FaceAttendanceApp(tk.Tk):
 
         lbl_h = tk.Label(
             tab,
-            text="⚙️ Quản lý danh sách nhân viên",
+            text="⚙️ Quản lý danh sách nhân viên (Soft Delete & Cloudinary)",
             font=("Segoe UI", 18, "bold"),
             fg=self.TEXT_MAIN,
             bg=self.CONTENT_BG,
         )
         lbl_h.pack(anchor="w", pady=(0, 15))
 
-        # Action Bar
         act_card = tk.Frame(tab, bg=self.CARD_BG, highlightbackground=self.BORDER_COLOR, highlightthickness=1, padx=15, pady=10)
         act_card.pack(fill="x", pady=(0, 15))
 
-        btn_reload = ttk.Button(act_card, text="🔄 Tải lại danh sách", command=self.refresh_employee_list)
-        btn_reload.pack(side="left", padx=5)
+        btn_face = ttk.Button(act_card, text="📸 Đăng ký / Cập nhật mặt", style="Primary.TButton", command=self.open_selected_employee_face_update)
+        btn_face.pack(side="left", padx=(0, 10))
 
-        btn_del = ttk.Button(act_card, text="🗑️ Xóa nhân viên đã chọn", style="Danger.TButton", command=self.delete_selected_employee)
+        btn_del = ttk.Button(act_card, text="⏸️ Ngưng HĐ (INACTIVE)", style="Danger.TButton", command=self.delete_selected_employee)
         btn_del.pack(side="left", padx=5)
 
-        # Table
+        btn_act = ttk.Button(act_card, text="✅ Kích hoạt (ACTIVE)", style="Success.TButton", command=self.activate_selected_employee)
+        btn_act.pack(side="left", padx=5)
+
+        btn_hard_del = ttk.Button(act_card, text="🔥 Xóa vĩnh viễn", style="Danger.TButton", command=self.hard_delete_selected_employee)
+        btn_hard_del.pack(side="left", padx=5)
+
         table_container = tk.Frame(tab, bg=self.CARD_BG, highlightbackground=self.BORDER_COLOR, highlightthickness=1)
         table_container.pack(fill="both", expand=True)
 
-        cols = ("emp_code", "full_name", "created_at", "photo_count")
+        cols = ("emp_code", "full_name", "dept", "pos", "status", "face_ai", "created_at", "avatar")
         self.emp_tree = ttk.Treeview(table_container, columns=cols, show="headings", style="Custom.Treeview")
         self.emp_tree.heading("emp_code", text="Mã NV")
         self.emp_tree.heading("full_name", text="Họ và Tên")
-        self.emp_tree.heading("created_at", text="Ngày đăng ký")
-        self.emp_tree.heading("photo_count", text="Số ảnh Dataset")
+        self.emp_tree.heading("dept", text="Phòng ban")
+        self.emp_tree.heading("pos", text="Chức vụ")
+        self.emp_tree.heading("status", text="Trạng thái")
+        self.emp_tree.heading("face_ai", text="Khuôn mặt AI")
+        self.emp_tree.heading("created_at", text="Ngày tạo")
+        self.emp_tree.heading("avatar", text="Cloudinary Avatar")
 
-        self.emp_tree.column("emp_code", width=120, anchor="center")
-        self.emp_tree.column("full_name", width=260, anchor="w")
-        self.emp_tree.column("created_at", width=180, anchor="center")
-        self.emp_tree.column("photo_count", width=140, anchor="center")
+        self.emp_tree.column("emp_code", width=85, anchor="center")
+        self.emp_tree.column("full_name", width=180, anchor="w")
+        self.emp_tree.column("dept", width=100, anchor="w")
+        self.emp_tree.column("pos", width=100, anchor="w")
+        self.emp_tree.column("status", width=85, anchor="center")
+        self.emp_tree.column("face_ai", width=160, anchor="center")
+        self.emp_tree.column("created_at", width=130, anchor="center")
+        self.emp_tree.column("avatar", width=120, anchor="center")
+
+        # Double click to update face
+        self.emp_tree.bind("<Double-1>", lambda e: self.open_selected_employee_face_update())
 
         scroll_y = ttk.Scrollbar(table_container, orient="vertical", command=self.emp_tree.yview)
         self.emp_tree.configure(yscrollcommand=scroll_y.set)
         scroll_y.pack(side="right", fill="y")
         self.emp_tree.pack(fill="both", expand=True, padx=10, pady=10)
 
+    def open_selected_employee_face_update(self):
+        sel = self.emp_tree.selection()
+        if not sel:
+            messagebox.showwarning("Chưa chọn", "Vui lòng chọn 1 nhân viên trong bảng để nạp/cập nhật khuôn mặt.")
+            return
+
+        item = self.emp_tree.item(sel[0])
+        code = str(item["values"][0]).strip()
+        self.load_employee_into_register(code, auto_switch_tab=True)
+
     def refresh_employee_list(self):
         def worker():
             try:
-                employees = get_employees()
+                employees = get_employees_with_stats(status=None)
+                self.cached_employees_stats = employees
                 rows_data = []
                 for emp in employees:
-                    code = emp["employee_code"]
-                    emp_dir = os.path.join(DATASET_DIR, code)
-                    photo_count = len(os.listdir(emp_dir)) if os.path.isdir(emp_dir) else 0
+                    avatar_status = "Đã tải lên" if emp.get("image_url") else "Chưa có"
+                    cnt = emp.get("embedding_count", 0)
+                    if cnt == 0:
+                        face_status = "⚠️ Chưa có (Web Admin)"
+                    else:
+                        face_status = f"✅ {cnt} vectors"
+
                     rows_data.append((
-                        code,
+                        emp["employee_code"],
                         emp["full_name"],
+                        emp["department"],
+                        emp["position"],
+                        emp["status"],
+                        face_status,
                         emp["created_at"],
-                        f"{photo_count} ảnh",
+                        avatar_status,
                     ))
 
                 def apply():
@@ -1733,18 +2075,14 @@ class FaceAttendanceApp(tk.Tk):
                 self.after(0, apply)
             except Exception as e:
                 err_text = str(e)
-                def show_err(msg=err_text):
-                    messagebox.showerror("Lỗi", f"Không thể lấy danh sách nhân viên: {msg}")
-                self.after(0, show_err)
+                self.after(0, lambda msg=err_text: messagebox.showerror("Lỗi", f"Không thể lấy danh sách nhân viên: {msg}"))
 
         threading.Thread(target=worker, daemon=True).start()
-
-
 
     def delete_selected_employee(self):
         sel = self.emp_tree.selection()
         if not sel:
-            messagebox.showwarning("Chưa chọn", "Vui lòng chọn 1 nhân viên trong bảng để xóa.")
+            messagebox.showwarning("Chưa chọn", "Vui lòng chọn 1 nhân viên trong bảng để thực hiện Soft Delete.")
             return
 
         item = self.emp_tree.item(sel[0])
@@ -1752,26 +2090,90 @@ class FaceAttendanceApp(tk.Tk):
         name = item["values"][1]
 
         confirm = messagebox.askyesno(
-            "Xác nhận xóa",
-            f"Bạn có chắc chắn muốn xóa nhân viên:\n[{code}] {name}\nToàn bộ lịch sử chấm công và ảnh khuôn mặt sẽ bị xóa?",
+            "Xác nhận Soft Delete",
+            f"Bạn có chắc chắn muốn ngưng hoạt động (INACTIVE) nhân viên:\n[{code}] {name}?\n\n"
+            f"• Nhân viên sẽ bị gỡ khỏi FAISS Index (không còn được nhận diện).\n"
+            f"• Toàn bộ lịch sử chấm công vẫn được bảo toàn trong CSDL SQL Server.",
         )
 
         if confirm:
             try:
-                delete_employee(code)
-                self.reload_faces()
+                emp = get_employee(code)
+                soft_delete_employee(code)
 
-                emp_dir = os.path.join(DATASET_DIR, code)
-                if os.path.isdir(emp_dir):
-                    shutil.rmtree(emp_dir, ignore_errors=True)
+                if emp:
+                    get_faiss_engine().remove_employee(emp["id"])
 
-                messagebox.showinfo("Thành công", f"Đã xóa nhân viên {code} thành công.")
+                messagebox.showinfo("Thành công", f"Đã chuyển trạng thái nhân viên {code} sang INACTIVE thành công.")
                 self.refresh_employee_list()
+                self.update_db_badge()
             except Exception as ex:
-                messagebox.showerror("Lỗi khi xóa", f"Chi tiết lỗi: {str(ex)}")
+                messagebox.showerror("Lỗi khi xóa mềm", f"Chi tiết lỗi: {str(ex)}")
+
+    def activate_selected_employee(self):
+        sel = self.emp_tree.selection()
+        if not sel:
+            messagebox.showwarning("Chưa chọn", "Vui lòng chọn 1 nhân viên trong bảng để kích hoạt lại.")
+            return
+
+        item = self.emp_tree.item(sel[0])
+        code = item["values"][0]
+        name = item["values"][1]
+
+        confirm = messagebox.askyesno(
+            "Xác nhận Kích hoạt",
+            f"Bạn có chắc chắn muốn kích hoạt lại (ACTIVE) nhân viên:\n[{code}] {name}?\n\n"
+            f"• Nhân viên sẽ được đưa trở lại FAISS Index để tiếp tục chấm công.",
+        )
+
+        if confirm:
+            try:
+                activate_employee(code)
+                get_faiss_engine().rebuild_from_database()
+                messagebox.showinfo("Thành công", f"Đã kích hoạt lại nhân viên {code} (ACTIVE) và cập nhật FAISS Index!")
+                self.refresh_employee_list()
+                self.update_db_badge()
+            except Exception as ex:
+                messagebox.showerror("Lỗi khi kích hoạt", f"Chi tiết lỗi: {str(ex)}")
+
+    def hard_delete_selected_employee(self):
+        sel = self.emp_tree.selection()
+        if not sel:
+            messagebox.showwarning("Chưa chọn", "Vui lòng chọn 1 nhân viên trong bảng để xóa vĩnh viễn.")
+            return
+
+        item = self.emp_tree.item(sel[0])
+        code = item["values"][0]
+        name = item["values"][1]
+
+        confirm = messagebox.askyesno(
+            "CẢNH BÁO: XÓA VĨNH VIỄN!",
+            f"⚠️ Bạn có chắc chắn muốn XÓA HOÀN TOÀN nhân viên:\n[{code}] {name}?\n\n"
+            f"• Toàn bộ hồ sơ nhân viên sẽ bị xóa khỏi SQL Server.\n"
+            f"• Toàn bộ lịch sử chấm công và các vector khuôn mặt sẽ bị xóa vĩnh viễn.\n"
+            f"• Ảnh đại diện trên Cloudinary sẽ bị xóa.\n"
+            f"• Hành động này KHÔNG THỂ khôi phục lại!",
+            icon="warning",
+        )
+
+        if confirm:
+            try:
+                ok, cloudinary_pid = hard_delete_employee(code)
+                if ok:
+                    if cloudinary_pid:
+                        threading.Thread(target=delete_employee_avatar, args=(cloudinary_pid,), daemon=True).start()
+
+                    get_faiss_engine().rebuild_from_database()
+                    messagebox.showinfo("Thành công", f"Đã xóa vĩnh viễn nhân viên {code} khỏi toàn bộ hệ thống!")
+                    self.refresh_employee_list()
+                    self.update_db_badge()
+                else:
+                    messagebox.showerror("Lỗi", "Không tìm thấy nhân viên để xóa.")
+            except Exception as ex:
+                messagebox.showerror("Lỗi khi xóa vĩnh viễn", f"Chi tiết lỗi: {str(ex)}")
 
     # ==========================================
-    # 7. TAB: CẤU HÌNH DATABASE
+    # 7. TAB: CẤU HÌNH DATABASE (SQL SERVER ONLY)
     # ==========================================
     def _init_database_tab(self):
         tab = tk.Frame(self.content_area, bg=self.CONTENT_BG)
@@ -1779,7 +2181,7 @@ class FaceAttendanceApp(tk.Tk):
 
         lbl_h = tk.Label(
             tab,
-            text="🗄️ Cấu hình Cơ sở dữ liệu (Database Settings)",
+            text="🗄️ Cấu hình Microsoft SQL Server (Doanh Nghiệp)",
             font=("Segoe UI", 18, "bold"),
             fg=self.TEXT_MAIN,
             bg=self.CONTENT_BG,
@@ -1789,62 +2191,25 @@ class FaceAttendanceApp(tk.Tk):
         card = tk.Frame(tab, bg=self.CARD_BG, highlightbackground=self.BORDER_COLOR, highlightthickness=1, padx=25, pady=25)
         card.pack(fill="x")
 
-        # Lựa chọn loại CSDL
-        tk.Label(card, text="Chọn loại Cơ sở dữ liệu:", font=("Segoe UI", 11, "bold"), bg=self.CARD_BG).pack(anchor="w", pady=(0, 10))
-
-        self.var_db_type = tk.StringVar(value="sqlite")
-        rb_frame = tk.Frame(card, bg=self.CARD_BG)
-        rb_frame.pack(anchor="w", pady=(0, 15))
-
-        rb_sqlite = tk.Radiobutton(
-            rb_frame,
-            text="SQLite (Cục bộ, nhẹ & không cần cài server)",
-            variable=self.var_db_type,
-            value="sqlite",
-            font=("Segoe UI", 10),
-            bg=self.CARD_BG,
-            command=self._on_db_type_changed,
-        )
-        rb_sqlite.pack(side="left", padx=(0, 20))
-
-        rb_sqlserver = tk.Radiobutton(
-            rb_frame,
-            text="Microsoft SQL Server (Doanh nghiệp, máy chủ)",
-            variable=self.var_db_type,
-            value="sqlserver",
-            font=("Segoe UI", 10),
-            bg=self.CARD_BG,
-            command=self._on_db_type_changed,
-        )
-        rb_sqlserver.pack(side="left")
-
-        # 1. Khung cấu hình SQLite
-        self.frame_sqlite_cfg = tk.LabelFrame(card, text="Cấu hình SQLite", font=("Segoe UI", 10, "bold"), bg=self.CARD_BG, padx=15, pady=15)
-        self.frame_sqlite_cfg.pack(fill="x", pady=10)
-
-        tk.Label(self.frame_sqlite_cfg, text="Đường dẫn file DB:", font=("Segoe UI", 9), bg=self.CARD_BG).grid(row=0, column=0, sticky="w", pady=5)
-        self.ent_sqlite_path = ttk.Entry(self.frame_sqlite_cfg, font=("Segoe UI", 9), width=40)
-        self.ent_sqlite_path.grid(row=0, column=1, sticky="w", padx=10, pady=5)
-
-        # 2. Khung cấu hình SQL Server
-        self.frame_sqlserver_cfg = tk.LabelFrame(card, text="Cấu hình Microsoft SQL Server", font=("Segoe UI", 10, "bold"), bg=self.CARD_BG, padx=15, pady=15)
+        # Khung cấu hình SQL Server
+        self.frame_sqlserver_cfg = tk.LabelFrame(card, text="Thông số kết nối Microsoft SQL Server", font=("Segoe UI", 10, "bold"), bg=self.CARD_BG, padx=15, pady=15)
         self.frame_sqlserver_cfg.pack(fill="x", pady=10)
 
-        tk.Label(self.frame_sqlserver_cfg, text="Server:", font=("Segoe UI", 9), bg=self.CARD_BG).grid(row=0, column=0, sticky="w", pady=5)
+        tk.Label(self.frame_sqlserver_cfg, text="Server Host / Instance:", font=("Segoe UI", 9, "bold"), bg=self.CARD_BG).grid(row=0, column=0, sticky="w", pady=6)
         self.ent_sql_server = ttk.Entry(self.frame_sqlserver_cfg, font=("Segoe UI", 9), width=35)
-        self.ent_sql_server.grid(row=0, column=1, sticky="w", padx=10, pady=5)
+        self.ent_sql_server.grid(row=0, column=1, sticky="w", padx=10, pady=6)
 
-        tk.Label(self.frame_sqlserver_cfg, text="Database Name:", font=("Segoe UI", 9), bg=self.CARD_BG).grid(row=1, column=0, sticky="w", pady=5)
+        tk.Label(self.frame_sqlserver_cfg, text="Database Name:", font=("Segoe UI", 9, "bold"), bg=self.CARD_BG).grid(row=1, column=0, sticky="w", pady=6)
         self.ent_sql_db = ttk.Entry(self.frame_sqlserver_cfg, font=("Segoe UI", 9), width=35)
-        self.ent_sql_db.grid(row=1, column=1, sticky="w", padx=10, pady=5)
+        self.ent_sql_db.grid(row=1, column=1, sticky="w", padx=10, pady=6)
 
-        tk.Label(self.frame_sqlserver_cfg, text="ODBC Driver:", font=("Segoe UI", 9), bg=self.CARD_BG).grid(row=2, column=0, sticky="w", pady=5)
+        tk.Label(self.frame_sqlserver_cfg, text="ODBC Driver:", font=("Segoe UI", 9, "bold"), bg=self.CARD_BG).grid(row=2, column=0, sticky="w", pady=6)
         self.cb_sql_driver = ttk.Combobox(self.frame_sqlserver_cfg, font=("Segoe UI", 9), width=33, state="readonly")
         drivers = get_available_sqlserver_drivers()
         self.cb_sql_driver["values"] = drivers
         if drivers:
             self.cb_sql_driver.current(0)
-        self.cb_sql_driver.grid(row=2, column=1, sticky="w", padx=10, pady=5)
+        self.cb_sql_driver.grid(row=2, column=1, sticky="w", padx=10, pady=6)
 
         self.var_sql_trusted = tk.BooleanVar(value=True)
         self.chk_sql_trusted = tk.Checkbutton(
@@ -1855,15 +2220,15 @@ class FaceAttendanceApp(tk.Tk):
             bg=self.CARD_BG,
             command=self._on_trusted_auth_changed,
         )
-        self.chk_sql_trusted.grid(row=3, column=0, columnspan=2, sticky="w", pady=5)
+        self.chk_sql_trusted.grid(row=3, column=0, columnspan=2, sticky="w", pady=6)
 
-        tk.Label(self.frame_sqlserver_cfg, text="Username:", font=("Segoe UI", 9), bg=self.CARD_BG).grid(row=4, column=0, sticky="w", pady=5)
+        tk.Label(self.frame_sqlserver_cfg, text="SQL Username (nếu dùng SQL Auth):", font=("Segoe UI", 9), bg=self.CARD_BG).grid(row=4, column=0, sticky="w", pady=6)
         self.ent_sql_user = ttk.Entry(self.frame_sqlserver_cfg, font=("Segoe UI", 9), width=25)
-        self.ent_sql_user.grid(row=4, column=1, sticky="w", padx=10, pady=5)
+        self.ent_sql_user.grid(row=4, column=1, sticky="w", padx=10, pady=6)
 
-        tk.Label(self.frame_sqlserver_cfg, text="Password:", font=("Segoe UI", 9), bg=self.CARD_BG).grid(row=5, column=0, sticky="w", pady=5)
+        tk.Label(self.frame_sqlserver_cfg, text="SQL Password:", font=("Segoe UI", 9), bg=self.CARD_BG).grid(row=5, column=0, sticky="w", pady=6)
         self.ent_sql_pwd = ttk.Entry(self.frame_sqlserver_cfg, font=("Segoe UI", 9), width=25, show="*")
-        self.ent_sql_pwd.grid(row=5, column=1, sticky="w", padx=10, pady=5)
+        self.ent_sql_pwd.grid(row=5, column=1, sticky="w", padx=10, pady=6)
 
         # Buttons
         btn_box = tk.Frame(card, bg=self.CARD_BG)
@@ -1877,15 +2242,6 @@ class FaceAttendanceApp(tk.Tk):
 
         self.refresh_db_settings_tab()
 
-    def _on_db_type_changed(self):
-        db_t = self.var_db_type.get()
-        if db_t == "sqlite":
-            self.frame_sqlite_cfg.pack(fill="x", pady=10)
-            self.frame_sqlserver_cfg.pack_forget()
-        else:
-            self.frame_sqlserver_cfg.pack(fill="x", pady=10)
-            self.frame_sqlite_cfg.pack_forget()
-
     def _on_trusted_auth_changed(self):
         is_trusted = self.var_sql_trusted.get()
         if is_trusted:
@@ -1897,37 +2253,30 @@ class FaceAttendanceApp(tk.Tk):
 
     def refresh_db_settings_tab(self):
         cfg = load_db_config()
-        db_type = cfg.get("db_type", "sqlite")
-        self.var_db_type.set(db_type)
+        sql_cfg = cfg.get("sqlserver", config.get_db_dict())
 
-        self.ent_sqlite_path.delete(0, tk.END)
-        self.ent_sqlite_path.insert(0, cfg.get("sqlite_path", "attendance.db"))
-
-        sql_cfg = cfg.get("sqlserver", {})
         self.ent_sql_server.delete(0, tk.END)
-        self.ent_sql_server.insert(0, sql_cfg.get("server", "localhost"))
+        self.ent_sql_server.insert(0, sql_cfg.get("server", config.DB_SERVER))
 
         self.ent_sql_db.delete(0, tk.END)
-        self.ent_sql_db.insert(0, sql_cfg.get("database", "FaceAttendanceDB"))
+        self.ent_sql_db.insert(0, sql_cfg.get("database", config.DB_DATABASE))
 
-        driver = sql_cfg.get("driver", "ODBC Driver 17 for SQL Server")
+        driver = sql_cfg.get("driver", config.DB_DRIVER)
         if driver in self.cb_sql_driver["values"]:
             self.cb_sql_driver.set(driver)
 
-        self.var_sql_trusted.set(sql_cfg.get("trusted_connection", True))
+        self.var_sql_trusted.set(sql_cfg.get("trusted_connection", config.DB_TRUSTED_CONNECTION))
         self.ent_sql_user.delete(0, tk.END)
-        self.ent_sql_user.insert(0, sql_cfg.get("username", "sa"))
+        self.ent_sql_user.insert(0, sql_cfg.get("username", config.DB_USER))
 
         self.ent_sql_pwd.delete(0, tk.END)
-        self.ent_sql_pwd.insert(0, sql_cfg.get("password", ""))
+        self.ent_sql_pwd.insert(0, sql_cfg.get("password", config.DB_PASSWORD))
 
-        self._on_db_type_changed()
         self._on_trusted_auth_changed()
 
     def _get_current_ui_db_config(self):
         return {
-            "db_type": self.var_db_type.get(),
-            "sqlite_path": self.ent_sqlite_path.get().strip() or "attendance.db",
+            "db_type": "sqlserver",
             "sqlserver": {
                 "server": self.ent_sql_server.get().strip() or "localhost",
                 "database": self.ent_sql_db.get().strip() or "FaceAttendanceDB",
@@ -1960,15 +2309,20 @@ class FaceAttendanceApp(tk.Tk):
         save_db_config(cfg)
         try:
             init_db(cfg)
-            self.reload_faces()
+            get_faiss_engine().rebuild_from_database()
             self.update_db_badge()
-            messagebox.showinfo("Thành công", "Đã lưu cấu hình và khởi tạo CSDL thành công!")
+            messagebox.showinfo("Thành công", "Đã lưu cấu hình và khởi tạo CSDL SQL Server thành công!")
         except Exception as ex:
             messagebox.showerror("Lỗi khởi tạo", f"Không thể khởi tạo CSDL: {str(ex)}")
 
     def on_closing(self):
         self.stop_register_camera()
         self.stop_realtime_camera()
+        if hasattr(self, "executor"):
+            try:
+                self.executor.shutdown(wait=False)
+            except Exception:
+                pass
         self.destroy()
 
 

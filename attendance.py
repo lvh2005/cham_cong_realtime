@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 
+import config
 from database import (
     create_check_in,
     create_check_out,
@@ -13,56 +14,79 @@ from database import (
     get_open_attendance,
 )
 
-# Cooldown chống chấm công trùng (75 giây)
-COOLDOWN_SECONDS = 75
-_ATTENDANCE_LOCK = threading.Lock()
-_IN_MEMORY_COOLDOWN = {}  # {employee_code: timestamp}
+_ATTENDANCE_LOCK = threading.RLock()
+_IN_MEMORY_COOLDOWN: Dict[str, float] = {}  # {employee_code: timestamp}
+_COOLDOWN_LOCK = threading.Lock()
+
+
+def is_in_cooldown(employee_code: str) -> bool:
+    """Kiểm tra nhanh trong RAM xem nhân viên có đang trong thời gian cooldown không (0ms)."""
+    with _COOLDOWN_LOCK:
+        if employee_code in _IN_MEMORY_COOLDOWN:
+            elapsed = datetime.now().timestamp() - _IN_MEMORY_COOLDOWN[employee_code]
+            return elapsed < config.ATTENDANCE_COOLDOWN_SECONDS
+    return False
+
+
+def set_in_memory_cooldown(employee_code: str, timestamp: Optional[float] = None) -> None:
+    """Ghi nhận timestamp cooldown vào RAM."""
+    ts = timestamp if timestamp is not None else datetime.now().timestamp()
+    with _COOLDOWN_LOCK:
+        _IN_MEMORY_COOLDOWN[employee_code] = ts
 
 
 def register_attendance(employee_code: str) -> Dict[str, Any]:
     """
-    Tự động chuyển trạng thái:
-    - Không có phiên mở -> Check-in.
-    - Có phiên mở -> Check-out.
-    Có cooldown bộ nhớ RAM + CSDL để tránh gọi CSDL liên tục từ camera.
+    Tự động ghi nhận chấm công (Check-in / Check-out) trên Microsoft SQL Server:
+    - Nếu chưa có phiên mở -> Check-in.
+    - Nếu đã có phiên mở -> Check-out.
+    - Áp dụng Cooldown RAM + Database từ config.ATTENDANCE_COOLDOWN_SECONDS chống chấm công liên tục.
     """
     with _ATTENDANCE_LOCK:
         now = datetime.now()
         now_ts = now.timestamp()
         now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+        cooldown_sec = config.ATTENDANCE_COOLDOWN_SECONDS
 
         # 1. Kiểm tra cache RAM trước (0ms, không tốn tài nguyên DB)
-        if employee_code in _IN_MEMORY_COOLDOWN:
-            elapsed = now_ts - _IN_MEMORY_COOLDOWN[employee_code]
-            if elapsed < COOLDOWN_SECONDS:
-                return {
-                    "success": False,
-                    "cooldown": True,
-                    "message": f"Đang trong thời gian chống chấm công trùng (còn {int(COOLDOWN_SECONDS - elapsed)}s).",
-                }
+        with _COOLDOWN_LOCK:
+            if employee_code in _IN_MEMORY_COOLDOWN:
+                elapsed = now_ts - _IN_MEMORY_COOLDOWN[employee_code]
+                if elapsed < cooldown_sec:
+                    return {
+                        "success": False,
+                        "cooldown": True,
+                        "message": f"Đang trong thời gian chống chấm công trùng (còn {int(cooldown_sec - elapsed)}s).",
+                    }
 
         employee = get_employee(employee_code)
         if employee is None:
             return {
                 "success": False,
-                "message": "Không tìm thấy nhân viên.",
+                "message": "Không tìm thấy thông tin nhân viên trong hệ thống.",
+            }
+
+        if employee.get("status") == "INACTIVE":
+            return {
+                "success": False,
+                "message": "Nhân viên này đã ngưng hoạt động (INACTIVE).",
             }
 
         employee_name = employee["full_name"]
         last = get_last_attendance(employee_code)
 
-        # 2. Cooldown từ CSDL
+        # 2. Kiểm tra Cooldown từ CSDL SQL Server
         if last:
             last_time = datetime.strptime(last["check_in"], "%Y-%m-%d %H:%M:%S")
             if last["check_out"]:
                 last_time = datetime.strptime(last["check_out"], "%Y-%m-%d %H:%M:%S")
 
-            if (now - last_time).total_seconds() < COOLDOWN_SECONDS:
+            if (now - last_time).total_seconds() < cooldown_sec:
                 _IN_MEMORY_COOLDOWN[employee_code] = last_time.timestamp()
                 return {
                     "success": False,
                     "cooldown": True,
-                    "message": "Đang trong thời gian chống chấm công trùng.",
+                    "message": f"Đang trong thời gian chống chấm công trùng ({cooldown_sec}s).",
                 }
 
         open_record = get_open_attendance(employee_code)
@@ -97,9 +121,8 @@ def get_attendance_report(
     employee_code: Optional[str] = None,
 ) -> pd.DataFrame:
     """
-    Trả về DataFrame:
+    Truy vấn lịch sử chấm công từ Microsoft SQL Server và trả về DataFrame:
     Mã NV | Họ tên | Ngày | Giờ vào | Giờ ra | Tổng giờ làm
-    Tương thích hoàn toàn với cả SQLite và SQL Server.
     """
     conn = get_connection()
 
@@ -155,7 +178,6 @@ def get_attendance_report(
             ]
         )
 
-
     df["check_in_dt"] = pd.to_datetime(df["check_in"], errors="coerce")
     df["check_out_dt"] = pd.to_datetime(df["check_out"], errors="coerce")
 
@@ -195,5 +217,3 @@ def get_attendance_report(
     ]
 
     return result
-
-
