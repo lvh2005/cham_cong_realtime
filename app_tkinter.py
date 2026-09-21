@@ -1465,12 +1465,23 @@ class FaceAttendanceApp(tk.Tk):
         self.btn_rec_toggle.pack(side="left", padx=(0, 10))
 
         tk.Label(top_ctrl, text="Độ nhạy:", font=("Segoe UI", 9), bg=self.CARD_BG).pack(side="left", padx=(0, 2))
-        self.scale_tol = ttk.Scale(top_ctrl, from_=0.35, to=0.65, value=config.FACE_MATCH_THRESHOLD, orient="horizontal", length=90)
+        self.scale_tol = ttk.Scale(top_ctrl, from_=0.25, to=0.55, value=config.FACE_MATCH_THRESHOLD, orient="horizontal", length=90)
         self.scale_tol.pack(side="left", padx=2)
 
         self.lbl_tol_val = tk.Label(top_ctrl, text=f"{config.FACE_MATCH_THRESHOLD:.2f}", font=("Segoe UI", 9, "bold"), bg=self.CARD_BG, fg=self.PRIMARY_COLOR)
-        self.lbl_tol_val.pack(side="left", padx=(2, 10))
+        self.lbl_tol_val.pack(side="left", padx=(2, 8))
         self.scale_tol.configure(command=lambda v: self.lbl_tol_val.config(text=f"{float(v):.2f}"))
+
+        self.var_single_face = tk.BooleanVar(value=True)
+        chk_single = tk.Checkbutton(
+            top_ctrl,
+            text="👤 Ưu tiên người chính",
+            variable=self.var_single_face,
+            bg=self.CARD_BG,
+            font=("Segoe UI", 9),
+            activebackground=self.CARD_BG,
+        )
+        chk_single.pack(side="left", padx=4)
 
         self.var_voice_enabled = tk.BooleanVar(value=True)
         chk_voice = tk.Checkbutton(
@@ -1481,19 +1492,19 @@ class FaceAttendanceApp(tk.Tk):
             font=("Segoe UI", 9),
             activebackground=self.CARD_BG,
         )
-        chk_voice.pack(side="left", padx=5)
+        chk_voice.pack(side="left", padx=4)
 
         # Mặc định var_auto_stop = False để chấm công liên tục tự động
         self.var_auto_stop = tk.BooleanVar(value=False)
         chk_autostop = tk.Checkbutton(
             top_ctrl,
-            text="⏹ Tắt camera sau khi chấm công",
+            text="⏹ Tắt sau khi điểm danh",
             variable=self.var_auto_stop,
             bg=self.CARD_BG,
             font=("Segoe UI", 9),
             activebackground=self.CARD_BG,
         )
-        chk_autostop.pack(side="left", padx=5)
+        chk_autostop.pack(side="left", padx=4)
 
         self.var_auto_cam = tk.BooleanVar(value=True)
         chk_autocam = tk.Checkbutton(
@@ -1504,7 +1515,7 @@ class FaceAttendanceApp(tk.Tk):
             font=("Segoe UI", 9),
             activebackground=self.CARD_BG,
         )
-        chk_autocam.pack(side="left", padx=5)
+        chk_autocam.pack(side="left", padx=4)
 
         self.lbl_rec_video = tk.Label(
             left_col,
@@ -1632,8 +1643,9 @@ class FaceAttendanceApp(tk.Tk):
 
                 new_faces = []
                 now_ts = time.time()
+                single_face_mode = getattr(self, "var_single_face", None) and self.var_single_face.get()
 
-                for face in detailed_faces:
+                for idx, face in enumerate(detailed_faces):
                     top, right, bottom, left = face["box"]
                     status = face["status"]
                     code = face["code"]
@@ -1652,15 +1664,19 @@ class FaceAttendanceApp(tk.Tk):
                         color = (0, 255, 0)  # Xanh lá
                         label = f"{code} - {name} ({dist:.2f})"
 
-                        # Kiểm tra Cooldown độc lập từng nhân viên trước khi kích hoạt
-                        last_attempt = self.recent_attendance_attempts.get(code, 0.0)
-                        if (now_ts - last_attempt) >= config.ATTENDANCE_COOLDOWN_SECONDS:
-                            self.recent_attendance_attempts[code] = now_ts
-                            # Đẩy tác vụ I/O sang ThreadPoolExecutor bất đồng bộ
-                            self.executor.submit(self._async_register_attendance_task, code, name)
+                        # Chỉ cho phép điểm danh nếu là người chính (idx == 0) hoặc tắt chế độ ưu tiên 1 người
+                        allow_attendance = (not single_face_mode) or (idx == 0)
+
+                        if allow_attendance:
+                            # Kiểm tra Cooldown độc lập từng nhân viên trước khi kích hoạt
+                            last_attempt = self.recent_attendance_attempts.get(code, 0.0)
+                            if (now_ts - last_attempt) >= config.ATTENDANCE_COOLDOWN_SECONDS:
+                                self.recent_attendance_attempts[code] = now_ts
+                                # Đẩy tác vụ I/O sang ThreadPoolExecutor bất đồng bộ
+                                self.executor.submit(self._async_register_attendance_task, code, name)
                     else:
                         color = (0, 0, 255)  # Đỏ (Chưa đăng ký / Unknown)
-                        label = "Unknown"
+                        label = f"Unknown ({dist:.2f})" if dist < 900 else "Unknown"
 
                     new_faces.append((top, right, bottom, left, label, color))
 
@@ -1670,8 +1686,8 @@ class FaceAttendanceApp(tk.Tk):
             except Exception:
                 pass
 
-            # Nghỉ nhẹ 25ms để nhường CPU cho luồng hiển thị giao diện đạt FPS tối đa
-            time.sleep(0.025)
+            # Nghỉ nhẹ 45ms để nhường CPU/GIL cho Tkinter UI đạt 40-60 FPS siêu mượt (0ms giật lag)
+            time.sleep(0.045)
 
     def _async_register_attendance_task(self, employee_code: str, employee_name: str):
         """

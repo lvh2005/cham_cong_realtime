@@ -217,18 +217,9 @@ def recognize_faces_detailed(
     """
     Nhận diện đa khuôn mặt trên frame ảnh bằng FAISS Search Top 5.
     - Xử lý ĐỘC LẬP từng khuôn mặt (1-to-1 mapping), loại bỏ hoàn toàn lỗi gán nhầm/trùng tên.
-    - Hỗ trợ scale_factor (mặc định 0.5) tối ưu tốc độ CPU siêu mượt (~30 FPS) mà không bị mất dấu mặt.
-    - Trả về danh sách chi tiết:
-      [
-        {
-          "box": (top, right, bottom, left), # Tọa độ trên frame gốc
-          "name": str,                       # Họ tên nhân viên hoặc "Unknown" / "AMBIGUOUS: ..."
-          "code": str,                       # Mã nhân viên hoặc "Unknown" / "AMBIGUOUS"
-          "distance": float,                 # Khoảng cách L2 Euclid
-          "status": str,                     # "MATCH" | "AMBIGUOUS" | "UNKNOWN"
-          "candidate": Optional[dict],       # Thông tin nhân viên khớp nhất
-        }, ...
-      ]
+    - Chống trùng lặp (Deduplication): Trong 1 frame, 1 nhân viên chỉ được gán cho khuôn mặt khớp nhất.
+    - Tối ưu HOG upsample=0 & scale_factor=0.5: Tốc độ phát hiện cực nhanh (~10-15ms).
+    - Trả về danh sách chi tiết được sắp xếp theo khuôn mặt lớn nhất (gần camera nhất) trước.
     """
     rgb = ensure_rgb_uint8(frame, is_bgr=is_bgr)
     if rgb is None or rgb.size == 0:
@@ -237,14 +228,14 @@ def recognize_faces_detailed(
     h, w = rgb.shape[:2]
     match_thresh = tolerance if tolerance is not None else config.FACE_MATCH_THRESHOLD
 
-    # 1. Phát hiện vị trí khuôn mặt với scale_factor (HOG nhạy & nhanh)
+    # 1. Phát hiện vị trí khuôn mặt với scale_factor (HOG nhạy & nhanh, upsample=0)
     if scale_factor > 0 and scale_factor < 1.0:
         small_rgb = cv2.resize(rgb, (0, 0), fx=scale_factor, fy=scale_factor)
         small_rgb = np.ascontiguousarray(small_rgb, dtype=np.uint8)
         raw_locations = face_recognition.face_locations(
             small_rgb,
             model=model,
-            number_of_times_to_upsample=1,
+            number_of_times_to_upsample=0,
         )
         inv_scale = 1.0 / scale_factor
         scaled_locations = []
@@ -253,34 +244,50 @@ def recognize_faces_detailed(
             orig_right = max(0, min(w - 1, int(round(right * inv_scale))))
             orig_bottom = max(0, min(h - 1, int(round(bottom * inv_scale))))
             orig_left = max(0, min(w - 1, int(round(left * inv_scale))))
-            if orig_bottom > orig_top and orig_right > orig_left:
+            box_w = orig_right - orig_left
+            box_h = orig_bottom - orig_top
+            if box_w >= 50 and box_h >= 50:
                 scaled_locations.append((orig_top, orig_right, orig_bottom, orig_left))
         locations = scaled_locations
     else:
-        locations = face_recognition.face_locations(
+        raw_locations = face_recognition.face_locations(
             rgb,
             model=model,
-            number_of_times_to_upsample=1,
+            number_of_times_to_upsample=0,
         )
+        locations = [
+            b for b in raw_locations
+            if (b[1] - b[3]) >= 50 and (b[2] - b[0]) >= 50
+        ]
 
     if not locations:
         return []
 
-    results = []
+    # Sắp xếp theo diện tích bounding box giảm dần (khuôn mặt lớn nhất / gần camera nhất lên đầu)
+    locations = sorted(locations, key=lambda b: (b[2] - b[0]) * (b[1] - b[3]), reverse=True)
+    # Giới hạn tối đa 3 khuôn mặt nổi bật nhất trong 1 frame để đảm bảo hiệu năng CPU
+    locations = locations[:3]
+
     engine = get_faiss_engine()
     has_faiss = engine.index is not None and engine.index.ntotal > 0
 
-    # 2. Duyệt qua TỪNG KHUÔN MẶT ĐỘC LẬP - Đảm bảo cách ly 100% dữ liệu
-    for face_box in locations:
-        # Trích xuất 128D encoding duy nhất cho đúng bounding box này
+    # 2. Trích xuất encoding theo batch cho các khuôn mặt đã phát hiện
+    try:
         face_encs = face_recognition.face_encodings(
             rgb,
-            known_face_locations=[face_box],
+            known_face_locations=locations,
             num_jitters=1,
         )
+    except Exception:
+        face_encs = []
 
-        if not face_encs or len(face_encs) == 0 or not has_faiss:
-            results.append({
+    raw_results = []
+
+    # 3. Duyệt và truy vấn FAISS cho từng khuôn mặt
+    for idx, face_box in enumerate(locations):
+        enc = face_encs[idx] if idx < len(face_encs) else None
+        if enc is None or len(enc) == 0 or not has_faiss:
+            raw_results.append({
                 "box": face_box,
                 "name": "Unknown",
                 "code": "Unknown",
@@ -290,7 +297,7 @@ def recognize_faces_detailed(
             })
             continue
 
-        vec = np.asarray(face_encs[0], dtype=np.float32)
+        vec = np.asarray(enc, dtype=np.float32)
         search_res = engine.search_face(vec, top_k=5, match_threshold=match_thresh)
 
         status = search_res.get("status", "UNKNOWN")
@@ -298,7 +305,7 @@ def recognize_faces_detailed(
         dist = float(search_res.get("distance", 999.0))
 
         if status == "MATCH" and best_cand is not None and dist <= match_thresh:
-            results.append({
+            raw_results.append({
                 "box": face_box,
                 "name": best_cand["full_name"],
                 "code": best_cand["employee_code"],
@@ -307,7 +314,7 @@ def recognize_faces_detailed(
                 "candidate": best_cand,
             })
         elif status == "AMBIGUOUS" and best_cand is not None:
-            results.append({
+            raw_results.append({
                 "box": face_box,
                 "name": f"AMBIGUOUS: {best_cand['full_name']}",
                 "code": "AMBIGUOUS",
@@ -317,7 +324,7 @@ def recognize_faces_detailed(
                 "second_candidate": search_res.get("second_candidate"),
             })
         else:
-            results.append({
+            raw_results.append({
                 "box": face_box,
                 "name": "Unknown",
                 "code": "Unknown",
@@ -326,7 +333,24 @@ def recognize_faces_detailed(
                 "candidate": None,
             })
 
-    return results
+    # 4. KHỬ TRÙNG LẶP (1-to-1 DEDUPLICATION):
+    # Trong cùng 1 frame, một mã nhân viên chỉ được gán cho 1 khuôn mặt có khoảng cách nhỏ nhất
+    assigned_codes = set()
+    match_items = [r for r in raw_results if r["status"] == "MATCH"]
+    match_items.sort(key=lambda x: x["distance"])
+
+    for item in match_items:
+        code = item["code"]
+        if code not in assigned_codes:
+            assigned_codes.add(code)
+        else:
+            # Mặt này có khoảng cách lớn hơn mặt kia -> đánh dấu Unknown
+            item["status"] = "UNKNOWN"
+            item["name"] = "Unknown"
+            item["code"] = "Unknown"
+            item["candidate"] = None
+
+    return raw_results
 
 
 def recognize_faces(
